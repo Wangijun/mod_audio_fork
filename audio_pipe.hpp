@@ -6,6 +6,7 @@
 #include <mutex>
 #include <queue>
 #include <unordered_map>
+#include <atomic>
 #include <thread>
 
 #include <libwebsockets.h>
@@ -49,7 +50,7 @@ namespace drachtio {
       int bidirectional_audio, notifyHandler_t callback);
     ~AudioPipe();  
 
-    LwsState_t getLwsState(void) { return m_state; }
+    LwsState_t getLwsState(void) { return m_state.load(std::memory_order_acquire); }
     void connect(void);
     void bufferForSending(const char* text);
     size_t binarySpaceAvailable(void) {
@@ -64,8 +65,8 @@ namespace drachtio {
     void binaryWritePtrAdd(size_t len) {
       m_audio_buffer_write_offset += len;
     }
-    void binaryWritePtrResetToZero(void) {
-      m_audio_buffer_write_offset = 0;
+    void binaryWritePtrReset(void) {
+      m_audio_buffer_write_offset = LWS_PRE;
     }
     void lockAudioBuffer(void) {
       m_audio_mutex.lock();
@@ -82,7 +83,7 @@ namespace drachtio {
 
     void do_graceful_shutdown();
     bool isGracefulShutdown(void) {
-      return m_gracefulShutdown;
+      return m_gracefulShutdown.load(std::memory_order_acquire);
     }
 
     bool is_bidirectional_audio_stream() {
@@ -91,7 +92,7 @@ namespace drachtio {
 
     void close() ;
 
-    // no default constructor or copying
+    // 禁止默认构造函数和拷贝
     AudioPipe() = delete;
     AudioPipe(const AudioPipe&) = delete;
     void operator=(const AudioPipe&) = delete;
@@ -111,20 +112,21 @@ namespace drachtio {
     static log_emit_function logger;
 
     static std::mutex mapMutex;
-    static bool stopFlag;
+    static std::atomic<bool> stopFlag;
 
     static AudioPipe* findAndRemovePendingConnect(struct lws *wsi);
     static AudioPipe* findPendingConnect(struct lws *wsi);
     static void addPendingConnect(AudioPipe* ap);
     static void addPendingDisconnect(AudioPipe* ap);
     static void addPendingWrite(AudioPipe* ap);
+    static void removeFromPendingLists(AudioPipe* ap);
     static void processPendingConnects(lws_per_vhost_data *vhd);
     static void processPendingDisconnects(lws_per_vhost_data *vhd);
     static void processPendingWrites(void);
     
     bool connect_client(struct lws_per_vhost_data *vhd);
 
-    LwsState_t m_state;
+    std::atomic<LwsState_t> m_state;
     std::string m_uuid;
     std::string m_host;
     std::string m_bugname;
@@ -147,7 +149,7 @@ namespace drachtio {
     log_emit_function m_logger;
     std::string m_username;
     std::string m_password;
-    bool m_gracefulShutdown;
+    std::atomic<bool> m_gracefulShutdown;
     bool m_bidirectional_audio_stream;
   };
 

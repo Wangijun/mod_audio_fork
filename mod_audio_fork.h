@@ -53,12 +53,12 @@ struct private_data {
   int graceful_shutdown:1;
   char initialMetadata[8192];
 
-  // for "mark" feature of bidirectional audio
+  // 双向音频的 "mark" 功能
   void *pVecMarksInInventory;
   void *pVecMarksInUse;
   void *pVecMarksCleared;
 
-  // bidirectional audio
+  // 双向音频
   void *streamingPlayoutBuffer;
   void *streamingPreBuffer;
   int streamingPreBufSize;
@@ -70,6 +70,7 @@ struct private_data {
 	int bidirectional_audio_stream;
   int bidirectional_audio_sample_rate;
   int clear_bidirectional_audio_buffer;
+  void *pMarkerPositions;  // std::vector<std::pair<size_t, std::string>>*
 
   switch_codec_t raw_write_codec;
   int raw_write_codec_initialized;
