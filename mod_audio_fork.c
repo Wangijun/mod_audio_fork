@@ -109,6 +109,7 @@ static switch_status_t start_capture(switch_core_session_t *session,
 		return status;
 	}
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "正在设置监听器私有数据 %s.\n", bugname);
+	((private_t *)pUserData)->media_bug = bug;
 	switch_channel_set_private(channel, bugname, bug);
 
 	if (fork_session_connect(&pUserData) != SWITCH_STATUS_SUCCESS) {

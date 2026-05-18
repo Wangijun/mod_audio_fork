@@ -53,6 +53,7 @@ namespace drachtio {
     LwsState_t getLwsState(void) { return m_state.load(std::memory_order_acquire); }
     void connect(void);
     void bufferForSending(const char* text);
+    void closeAndDestroy(void);
     size_t binarySpaceAvailable(void) {
       return m_audio_buffer_max_len - m_audio_buffer_write_offset;
     }
@@ -150,6 +151,8 @@ namespace drachtio {
     std::string m_username;
     std::string m_password;
     std::atomic<bool> m_gracefulShutdown;
+    std::atomic<bool> m_delete_on_close;
+    std::atomic<bool> m_write_pending;
     bool m_bidirectional_audio_stream;
   };
 

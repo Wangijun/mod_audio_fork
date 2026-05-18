@@ -39,6 +39,7 @@ struct private_data {
   char bugname[MAX_BUG_LEN+1];
   SpeexResamplerState *resampler;
   responseHandler_t responseHandler;
+  void *media_bug;
   void *pAudioPipe;
   int ws_state;
   char host[MAX_WS_URL_LEN];
