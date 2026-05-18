@@ -88,6 +88,7 @@ int AudioPipe::lws_callback(struct lws *wsi,
         if (ap) {
           ap->m_state.store(LWS_CLIENT_FAILED, std::memory_order_release);
           ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_FAIL, (char *) in, NULL, len);
+          delete ap;
         }
         else {
           switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_CONNECTION_ERROR 无法找到 wsi %p..\n", wsi);
@@ -102,7 +103,12 @@ int AudioPipe::lws_callback(struct lws *wsi,
           *ppAp = ap;
           ap->m_vhd = vhd;
           ap->m_state.store(LWS_CLIENT_CONNECTED, std::memory_order_release);
-          ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_SUCCESS, NULL, NULL, len);
+          if (ap->m_delete_on_close.load(std::memory_order_acquire)) {
+            addPendingDisconnect(ap);
+          }
+          else {
+            ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_SUCCESS, NULL, NULL, len);
+          }
         }
         else {
           switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_ESTABLISHED 无法找到 wsi %p..\n", wsi);
@@ -131,6 +137,8 @@ int AudioPipe::lws_callback(struct lws *wsi,
         //指针或引用的地方都必须将其视为不再有效
 
         *ppAp = NULL;
+        removeFromPendingLists(ap);
+        delete ap;
       }
       break;
 
@@ -163,6 +171,11 @@ int AudioPipe::lws_callback(struct lws *wsi,
             // 为所需的整块内存分配缓冲区
             assert(nullptr == ap->m_recv_buf);
             ap->m_recv_buf_len = len + lws_remaining_packet_payload(wsi);
+            if (ap->m_recv_buf_len > MAX_RECV_BUF_SIZE) {
+              ap->m_recv_buf_len = 0;
+              switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_RECEIVE 文本消息超过最大缓冲区，丢弃。\n");
+              break;
+            }
             ap->m_recv_buf = (uint8_t*) malloc(ap->m_recv_buf_len);
             if (!ap->m_recv_buf) {
               switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe: malloc 失败，跳过消息\n");
@@ -190,6 +203,12 @@ int AudioPipe::lws_callback(struct lws *wsi,
                 ap->m_recv_buf = newbuf;
                 ap->m_recv_buf_len = newlen;
                 ap->m_recv_buf_ptr = newbuf + write_offset;
+              }
+              else {
+                free(ap->m_recv_buf);
+                ap->m_recv_buf = ap->m_recv_buf_ptr = nullptr;
+                ap->m_recv_buf_len = 0;
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_RECEIVE 扩容失败，丢弃消息。\n");
               }
             }
           }
@@ -220,6 +239,7 @@ int AudioPipe::lws_callback(struct lws *wsi,
           switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE 无法找到 wsi %p..\n", wsi);
           return 0;
         }
+        ap->m_write_pending.store(false, std::memory_order_release);
 
         // 检查优雅关闭 - 发送剩余音频后关闭连接
         if (ap->isGracefulShutdown()) {
@@ -228,8 +248,22 @@ int AudioPipe::lws_callback(struct lws *wsi,
             std::lock_guard<std::mutex> lk(ap->m_audio_mutex);
             if (ap->m_audio_buffer_write_offset > LWS_PRE) {
               size_t datalen = ap->m_audio_buffer_write_offset - LWS_PRE;
-              lws_write(wsi, (unsigned char *) ap->m_audio_buffer + LWS_PRE, datalen, LWS_WRITE_BINARY);
-              ap->m_audio_buffer_write_offset = LWS_PRE;
+              int sent = lws_write(wsi, (unsigned char *) ap->m_audio_buffer + LWS_PRE, datalen, LWS_WRITE_BINARY);
+              if (sent >= (int)datalen) {
+                ap->m_audio_buffer_write_offset = LWS_PRE;
+              }
+              else if (sent > 0) {
+                size_t remaining = datalen - (size_t)sent;
+                memmove(ap->m_audio_buffer + LWS_PRE, ap->m_audio_buffer + LWS_PRE + sent, remaining);
+                ap->m_audio_buffer_write_offset = LWS_PRE + remaining;
+                lws_callback_on_writable(wsi);
+                return 0;
+              }
+              else {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                  "AudioPipe: 优雅关闭期间发送音频失败，关闭连接\n");
+                return -1;
+              }
             }
           }
           return -1;
@@ -253,7 +287,9 @@ int AudioPipe::lws_callback(struct lws *wsi,
             free(buf);
 
             if (m < n) {
-              return -1; // 发送完整消息失败
+              switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                "AudioPipe: 文本帧未完整发送，关闭连接以避免重复发送\n");
+              return -1;
             }
 
             // 移除已成功发送的消息
@@ -278,8 +314,21 @@ int AudioPipe::lws_callback(struct lws *wsi,
             if (sent < (int)datalen) {
               switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_WRITEABLE %s 尝试发送 %lu 仅发送了 %d wsi %p..\n",
                 ap->m_uuid.c_str(), datalen, sent, wsi);
+              if (sent > 0) {
+                size_t remaining = datalen - (size_t)sent;
+                memmove(ap->m_audio_buffer + LWS_PRE, ap->m_audio_buffer + LWS_PRE + sent, remaining);
+                ap->m_audio_buffer_write_offset = LWS_PRE + remaining;
+                lws_callback_on_writable(wsi);
+              }
+              else {
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                  "AudioPipe: 音频帧发送失败，关闭连接\n");
+                return -1;
+              }
             }
-            ap->m_audio_buffer_write_offset = LWS_PRE;
+            else {
+              ap->m_audio_buffer_write_offset = LWS_PRE;
+            }
           }
         }
 
@@ -330,7 +379,16 @@ void AudioPipe::processPendingConnects(lws_per_vhost_data *vhd) {
   }
   for (auto it = connects.begin(); it != connects.end(); ++it) {
     AudioPipe* ap = *it;
-    ap->connect_client(vhd);
+    if (!ap->connect_client(vhd)) {
+      {
+        std::lock_guard<std::mutex> guard(mutex_connects);
+        pendingConnects.remove(ap);
+      }
+      ap->m_state.store(LWS_CLIENT_FAILED, std::memory_order_release);
+      ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_FAIL,
+        "lws_client_connect_via_info returned null", NULL, 0);
+      delete ap;
+    }
   }
 }
 
@@ -345,7 +403,7 @@ void AudioPipe::processPendingDisconnects(lws_per_vhost_data * /*vhd*/) {
   }
   for (auto it = disconnects.begin(); it != disconnects.end(); ++it) {
     AudioPipe* ap = *it;
-    lws_callback_on_writable(ap->m_wsi);
+    if (ap->m_wsi) lws_callback_on_writable(ap->m_wsi);
   }
 }
 
@@ -360,7 +418,7 @@ void AudioPipe::processPendingWrites() {
   }
   for (auto it = writes.begin(); it != writes.end(); ++it) {
     AudioPipe* ap = *it;
-    lws_callback_on_writable(ap->m_wsi);
+    if (ap->m_wsi) lws_callback_on_writable(ap->m_wsi);
   }
 }
 
@@ -408,7 +466,7 @@ void AudioPipe::addPendingConnect(AudioPipe* ap) {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,"%s 添加连接后有 %lu 个待处理连接\n",
       ap->m_uuid.c_str(), pendingConnects.size());
   }
-  lws_cancel_service(context);
+  if (context) lws_cancel_service(context);
 }
 void AudioPipe::addPendingDisconnect(AudioPipe* ap) {
   ap->m_state.store(LWS_CLIENT_DISCONNECTING, std::memory_order_release);
@@ -425,6 +483,10 @@ void AudioPipe::addPendingDisconnect(AudioPipe* ap) {
   }
 }
 void AudioPipe::addPendingWrite(AudioPipe* ap) {
+  bool expected = false;
+  if (!ap->m_write_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
   {
     std::lock_guard<std::mutex> guard(mutex_writes);
     pendingWrites.push_back(ap);
@@ -449,6 +511,7 @@ void AudioPipe::removeFromPendingLists(AudioPipe* ap) {
     std::lock_guard<std::mutex> guard(mutex_writes);
     pendingWrites.remove(ap);
   }
+  ap->m_write_pending.store(false, std::memory_order_release);
 }
 
 bool AudioPipe::lws_service_thread() {
@@ -495,6 +558,7 @@ bool AudioPipe::lws_service_thread() {
 
   lwsl_notice("AudioPipe::lws_service_thread 结束\n");
   lws_context_destroy(context);
+  context = nullptr;
 
   return true;
 }
@@ -513,6 +577,7 @@ bool AudioPipe::deinitialize() {
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,"AudioPipe::deinitialize\n");
   std::lock_guard<std::mutex> lock(mapMutex);
   stopFlag.store(true, std::memory_order_release);
+  if (context) lws_cancel_service(context);
   if (serviceThread.joinable()) {
     serviceThread.join();
   }
@@ -527,7 +592,8 @@ AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, cons
   m_sslFlags(sslFlags), m_wsi(nullptr), m_audio_buffer_max_len(bufLen),
   m_audio_buffer_write_offset(LWS_PRE), m_audio_buffer_min_freespace(minFreespace),
   m_recv_buf(nullptr), m_recv_buf_ptr(nullptr),
-  m_vhd(nullptr), m_callback(callback), m_gracefulShutdown(false) {
+  m_vhd(nullptr), m_callback(callback), m_gracefulShutdown(false),
+  m_delete_on_close(false), m_write_pending(false) {
 
   if (username && password) {
     m_username.assign(username);
@@ -543,6 +609,28 @@ AudioPipe::~AudioPipe() {
 
 void AudioPipe::connect(void) {
   addPendingConnect(this);
+}
+
+void AudioPipe::closeAndDestroy(void) {
+  m_delete_on_close.store(true, std::memory_order_release);
+
+  LwsState_t state = m_state.load(std::memory_order_acquire);
+  if (state == LWS_CLIENT_CONNECTED) {
+    addPendingDisconnect(this);
+    return;
+  }
+
+  if (state == LWS_CLIENT_DISCONNECTING || state == LWS_CLIENT_CONNECTING) {
+    if (m_vhd) {
+      lws_cancel_service(m_vhd->context);
+    } else if (context) {
+      lws_cancel_service(context);
+    }
+    return;
+  }
+
+  removeFromPendingLists(this);
+  delete this;
 }
 
 bool AudioPipe::connect_client(struct lws_per_vhost_data *vhd) {

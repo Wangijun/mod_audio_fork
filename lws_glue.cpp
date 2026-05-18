@@ -12,9 +12,11 @@
 #include <utility>
 #include <cassert>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <sstream>
 #include <regex>
+#include <iterator>
 
 #include "base64.hpp"
 #include "parser.hpp"
@@ -43,6 +45,60 @@ namespace {
   static unsigned int nServiceThreads __attribute__((unused)) = std::max(1, std::min(requestedNumServiceThreads ? ::atoi(requestedNumServiceThreads) : 1, 5));
   static std::atomic<unsigned int> idxCallCount{0};
 
+  static void send_mark_event(private_t* tech_pvt, const char* name, int cleared = false);
+
+  static bool sessionBugStillActive(switch_core_session_t* session, private_t* tech_pvt) {
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    void* activeBug = switch_channel_get_private(channel, tech_pvt->bugname);
+    return activeBug && (!tech_pvt->media_bug || activeBug == tech_pvt->media_bug);
+  }
+
+  static void adjustMarkerPositionsForDroppedSamples(private_t* tech_pvt, size_t droppedSamples,
+    std::vector<std::pair<std::string, int>>* pendingMarkEvents) {
+    if (!tech_pvt->pMarkerPositions || droppedSamples == 0) return;
+
+    auto* markers = static_cast<std::vector<std::pair<size_t, std::string>>*>(tech_pvt->pMarkerPositions);
+    for (auto it = markers->begin(); it != markers->end(); ) {
+      if (it->first < droppedSamples) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+          "(%u) 标记 %s 所在音频已被丢弃，发送 cleared\n", tech_pvt->id, it->second.c_str());
+        if (pendingMarkEvents) pendingMarkEvents->push_back({it->second, true});
+        it = markers->erase(it);
+      }
+      else {
+        it->first -= droppedSamples;
+        ++it;
+      }
+    }
+  }
+
+  template<typename InputIt>
+  static void appendSamplesBounded(private_t* tech_pvt, CircularBuffer_t* buffer, InputIt begin, InputIt end,
+    const char* name, bool adjustMarkers, std::vector<std::pair<std::string, int>>* pendingMarkEvents = nullptr) {
+    size_t count = static_cast<size_t>(std::distance(begin, end));
+    if (count == 0 || buffer->capacity() == 0) return;
+
+    if (count > buffer->capacity()) {
+      size_t inputDrop = count - buffer->capacity();
+      size_t totalDrop = buffer->size() + inputDrop;
+      std::advance(begin, inputDrop);
+      count = buffer->capacity();
+      buffer->clear();
+      if (adjustMarkers) adjustMarkerPositionsForDroppedSamples(tech_pvt, totalDrop, pendingMarkEvents);
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+        "(%u) %s 输入超过容量，仅保留最新 %zu 个采样\n", tech_pvt->id, name, count);
+    }
+    else if (buffer->size() + count > buffer->capacity()) {
+      size_t drop = buffer->size() + count - buffer->capacity();
+      buffer->erase_begin(drop);
+      if (adjustMarkers) adjustMarkerPositionsForDroppedSamples(tech_pvt, drop, pendingMarkEvents);
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+        "(%u) %s 缓冲区已满，丢弃最旧 %zu 个采样\n", tech_pvt->id, name, drop);
+    }
+
+    buffer->insert(buffer->end(), begin, end);
+  }
+
   static bool markCountExceeded(private_t* tech_pvt) {
     if (nullptr != tech_pvt->pVecMarksInUse) {
       std::deque<std::string>* pVecMarksInUse = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInUse);
@@ -52,33 +108,49 @@ namespace {
     return false;
   }
 
-  switch_status_t processIncomingBinary(private_t* tech_pvt, switch_core_session_t* /*session*/, const char* message, size_t dataLength) {
+  switch_status_t processIncomingBinary(private_t* tech_pvt, switch_core_session_t* session, const char* message, size_t dataLength) {
+    std::vector<std::pair<std::string, int>> pendingMarkEvents;
+    std::vector<int16_t> inputSamples;
+    SpeexResamplerState* resampler = nullptr;
     if (tech_pvt->mutex) switch_mutex_lock(tech_pvt->mutex);
-    std::vector<uint8_t> data;
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    if (switch_channel_get_private(channel, tech_pvt->bugname) == nullptr) {
+      if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
+      return SWITCH_STATUS_FALSE;
+    }
+    std::vector<uint8_t> scratch;
+    const uint8_t* audioData = reinterpret_cast<const uint8_t*>(message);
+    size_t audioDataLength = dataLength;
 
-    // 如果存在预留字节，则前置它
-    if (tech_pvt->has_set_aside_byte) {
-        data.push_back(tech_pvt->set_aside_byte);
+    // 仅在需要拼接预留字节或保存奇数字节时分配临时缓冲。
+    if (tech_pvt->has_set_aside_byte || (dataLength % 2 != 0)) {
+      scratch.reserve(dataLength + 1);
+      if (tech_pvt->has_set_aside_byte) {
+        scratch.push_back(tech_pvt->set_aside_byte);
         tech_pvt->has_set_aside_byte = false;
+      }
+      scratch.insert(scratch.end(), message, message + dataLength);
+      if (scratch.size() % 2 != 0) {
+        tech_pvt->set_aside_byte = scratch.back();
+        tech_pvt->has_set_aside_byte = true;
+        scratch.pop_back();
+      }
+      audioData = scratch.data();
+      audioDataLength = scratch.size();
     }
 
-    // 追加新传入的消息
-    data.insert(data.end(), message, message + dataLength);
-
-    // 检查总数据长度是否为奇数
-    if (data.size() % 2 != 0) {
-        // 将最后一个字节预留
-        tech_pvt->set_aside_byte = data.back();
-        tech_pvt->has_set_aside_byte = true;
-        data.pop_back(); // 从数据向量中移除最后一个字节
+    if (audioDataLength == 0) {
+      if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
+      return SWITCH_STATUS_SUCCESS;
     }
 
     // 将数据转换为16位元素
-    const uint16_t* data_uint16 = reinterpret_cast<const uint16_t*>(data.data());
-    size_t numSamples = data.size() / sizeof(uint16_t);
+    const uint16_t* data_uint16 = reinterpret_cast<const uint16_t*>(audioData);
+    size_t numSamples = audioDataLength / sizeof(uint16_t);
 
     // 访问预缓冲区
     CircularBuffer_t* cBuffer = static_cast<CircularBuffer_t*>(tech_pvt->streamingPreBuffer);
+    CircularBuffer_t* playoutBuffer = static_cast<CircularBuffer_t*>(tech_pvt->streamingPlayoutBuffer);
 
     std::deque<std::string>* pVecMarksInInventory = nullptr;
     std::deque<std::string>* pVecMarksInUse = nullptr;
@@ -92,7 +164,7 @@ namespace {
       }
       auto* markers = static_cast<std::vector<std::pair<size_t, std::string>>*>(tech_pvt->pMarkerPositions);
       for (auto& markName : *pVecMarksInInventory) {
-        markers->push_back({cBuffer->size(), markName});
+        markers->push_back({playoutBuffer->size() + cBuffer->size(), markName});
       }
 
       // 将库存移至使用中
@@ -100,20 +172,8 @@ namespace {
       pVecMarksInInventory->clear();
     }
 
-    // 确保预缓冲区有足够的容量
-    if (cBuffer->capacity() - cBuffer->size() < numSamples) {
-        size_t newCapacity = cBuffer->size() + std::max(numSamples, (size_t)BUFFER_GROW_SIZE);
-        if (newCapacity > MAX_CIRCULAR_BUFFER_CAPACITY) {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                "(%u) pre-buffer 超过最大容量，清空\n", tech_pvt->id);
-            cBuffer->clear();
-            newCapacity = std::min((size_t)MAX_CIRCULAR_BUFFER_CAPACITY, cBuffer->size() + numSamples);
-        }
-        cBuffer->set_capacity(newCapacity);
-    }
-
     // 将数据追加到预缓冲区
-    cBuffer->insert(cBuffer->end(), data_uint16, data_uint16 + numSamples);
+    appendSamplesBounded(tech_pvt, cBuffer, data_uint16, data_uint16 + numSamples, "pre-buffer", false);
     //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "已追加 %zu 个16位采样到预缓冲区。\n", numSamples);
 
     // 如果预缓冲数据量未达到阈值，则返回
@@ -142,21 +202,43 @@ namespace {
         //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "由于降采样，临时移除 %u 个剩余采样。\n", numLeftoverSamples);
     }
 
+    if (cBuffer->size() > 0) {
+      uint16_t* linear = cBuffer->linearize();
+      const int16_t* linear16 = reinterpret_cast<const int16_t*>(linear);
+      inputSamples.assign(linear16, linear16 + cBuffer->size());
+    }
+    resampler = tech_pvt->bidirectional_audio_resampler;
+    cBuffer->clear();
+
+    // 将剩余采样放回预缓冲区以备下次使用
+    if (!leftoverSamples.empty()) {
+        cBuffer->insert(cBuffer->end(), leftoverSamples.begin(), leftoverSamples.end());
+        //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "将 %u 个剩余采样放回预缓冲区。\n", leftoverSamples.size());
+    }
+
     // 必要时重采样
     std::vector<int16_t> out;
     try {
-      if (tech_pvt->bidirectional_audio_resampler) {
-        // 改进：使用assign将循环缓冲区转换为向量以进行重采样
-        std::vector<int16_t> in;
-        in.assign(cBuffer->begin(), cBuffer->end());
-        out.resize(in.size() * 8); // 最大上采样为 8k -> 48k
+      if (resampler) {
+        const int16_t* in = inputSamples.data();
+        size_t inSampleCount = inputSamples.size();
+        size_t outCapacity = inSampleCount;
+        if (tech_pvt->bidirectional_audio_sample_rate > 0 &&
+            tech_pvt->sampling > tech_pvt->bidirectional_audio_sample_rate) {
+          outCapacity = ((inSampleCount * (size_t)tech_pvt->sampling) /
+            (size_t)tech_pvt->bidirectional_audio_sample_rate) + 256;
+        }
+        else {
+          outCapacity += 256;
+        }
+        out.resize(outCapacity);
 
-        spx_uint32_t in_len = in.size();
+        spx_uint32_t in_len = inSampleCount;
         spx_uint32_t out_len = out.size();
 
         //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "重采样 %u 个采样到可容纳 %u 个采样的缓冲区\n", in.size(), out_len);
 
-        speex_resampler_process_interleaved_int(tech_pvt->bidirectional_audio_resampler, in.data(), &in_len, out.data(), &out_len);
+        speex_resampler_process_interleaved_int(resampler, in, &in_len, out.data(), &out_len);
 
         // 调整输出缓冲区大小以匹配重采样器的输出长度
         //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "将输出缓冲区从 %u 调整为 %u 个采样\n", in.size(), out_len);
@@ -165,7 +247,7 @@ namespace {
       }
       else {
         // 如果不需要重采样，将预缓冲区的数据复制到输出缓冲区
-        out.assign(cBuffer->begin(), cBuffer->end());
+        out.assign(inputSamples.begin(), inputSamples.end());
       }
     } catch (const std::exception& e) {
       switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "重采样传入二进制消息时出错：%s\n", e.what());
@@ -178,43 +260,28 @@ namespace {
     }
 
     {
-      CircularBuffer_t *playoutBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
-
       try {
-        // 必要时调整缓冲区大小
-        if (playoutBuffer->capacity() - playoutBuffer->size() < out.size()) {
-          size_t newCapacity = playoutBuffer->size() + std::max(out.size(), (size_t)BUFFER_GROW_SIZE);
-          if (newCapacity > MAX_CIRCULAR_BUFFER_CAPACITY) {
-              switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                  "(%u) playout buffer 超过最大容量，清空\n", tech_pvt->id);
-              playoutBuffer->clear();
-              newCapacity = std::min((size_t)MAX_CIRCULAR_BUFFER_CAPACITY, playoutBuffer->size() + out.size());
-          }
-          playoutBuffer->set_capacity(newCapacity);
-          //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "已将播放缓冲区调整为新容量：%zu\n", newCapacity);
+        if (!sessionBugStillActive(session, tech_pvt)) {
+          if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
+          return SWITCH_STATUS_FALSE;
         }
+        CircularBuffer_t* playoutBuffer = static_cast<CircularBuffer_t*>(tech_pvt->streamingPlayoutBuffer);
         // 将数据推入缓冲区
-        playoutBuffer->insert(playoutBuffer->end(), out.begin(), out.end());
+        appendSamplesBounded(tech_pvt, playoutBuffer, out.begin(), out.end(), "playout buffer", true, &pendingMarkEvents);
         //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "已追加 %zu 个16位采样到播放缓冲区。\n", out.size());
       } catch (const std::exception& e) {
-        cBuffer->clear();
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "处理传入二进制消息时出错：%s\n", e.what());
         if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
         return SWITCH_STATUS_FALSE;
       } catch (...) {
-        cBuffer->clear();
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "处理传入二进制消息时出错\n");
         if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
         return SWITCH_STATUS_FALSE;
       }
-      cBuffer->clear();
-
-      // 将剩余采样放回预缓冲区以备下次使用
-      if (!leftoverSamples.empty()) {
-          cBuffer->insert(cBuffer->end(), leftoverSamples.begin(), leftoverSamples.end());
-          //switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "将 %u 个剩余采样放回预缓冲区。\n", leftoverSamples.size());
-      }
       if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
+      for (auto& markEvent : pendingMarkEvents) {
+        send_mark_event(tech_pvt, markEvent.first.c_str(), markEvent.second);
+      }
       return SWITCH_STATUS_SUCCESS;
     }
   }
@@ -246,32 +313,27 @@ namespace {
             std::string rawAudio = drachtio::base64_decode(jsonAudio->valuestring);
             size_t decodedLen = rawAudio.length();
             uint8_t *data = (uint8_t *) rawAudio.data();
+            std::vector<std::pair<std::string, int>> pendingMarkEvents;
 
             // 获取采样率（当前未使用，但已解析以备将来使用）
             cJSON* jsonSR = cJSON_GetObjectItem(jsonData, "sampleRate");
             (void)jsonSR;
 
-            // 访问缓冲区 - 使用阻塞锁以确保数据完整性
             if (nullptr != tech_pvt->mutex && switch_mutex_lock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {
+                if (!sessionBugStillActive(session, tech_pvt)) {
+                    switch_mutex_unlock(tech_pvt->mutex);
+                    if (jsonAudio) cJSON_Delete(jsonAudio);
+                    cJSON_Delete(json);
+                    return;
+                }
                 CircularBuffer_t *playoutBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
                 try {
                     // 将原始音频转换为int16_t向量
                     const int16_t* pAudio = reinterpret_cast<const int16_t*>(data);
                     size_t numSamples = decodedLen / sizeof(int16_t);
 
-                    // 必要时调整缓冲区大小
-                    if (playoutBuffer->capacity() - playoutBuffer->size() < numSamples) {
-                        size_t newCapacity = playoutBuffer->size() + std::max(numSamples, (size_t)BUFFER_GROW_SIZE);
-                        if (newCapacity > MAX_CIRCULAR_BUFFER_CAPACITY) {
-                            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                                "(%u) playout buffer 超过最大容量，清空\n", tech_pvt->id);
-                            playoutBuffer->clear();
-                            newCapacity = std::min((size_t)MAX_CIRCULAR_BUFFER_CAPACITY, playoutBuffer->size() + numSamples);
-                        }
-                        playoutBuffer->set_capacity(newCapacity);
-                    }
                     // 将数据推入缓冲区
-                    playoutBuffer->insert(playoutBuffer->end(), pAudio, pAudio + numSamples);
+                    appendSamplesBounded(tech_pvt, playoutBuffer, pAudio, pAudio + numSamples, "playout buffer", true, &pendingMarkEvents);
 
                     // switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%u) 已缓冲 %zu 字节TTS音频。缓冲区大小：%zu\n", tech_pvt->id, decodedLen, playoutBuffer->size());
 
@@ -282,6 +344,9 @@ namespace {
                 }
 
                 switch_mutex_unlock(tech_pvt->mutex);
+                for (auto& markEvent : pendingMarkEvents) {
+                    send_mark_event(tech_pvt, markEvent.first.c_str(), markEvent.second);
+                }
             } else {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) 为缓冲TTS锁定互斥锁失败\n", tech_pvt->id);
             }
@@ -302,7 +367,9 @@ namespace {
         // 这将丢弃已缓冲的传入音频
         if (tech_pvt->mutex) {
             switch_mutex_lock(tech_pvt->mutex);
-            tech_pvt->clear_bidirectional_audio_buffer = true;
+            if (sessionBugStillActive(session, tech_pvt)) {
+              tech_pvt->clear_bidirectional_audio_buffer = true;
+            }
             switch_mutex_unlock(tech_pvt->mutex);
         }
       }
@@ -311,27 +378,34 @@ namespace {
         if (data) {
           cJSON* name = cJSON_GetObjectItem(data, "name");
           if (cJSON_IsString(name) && name->valuestring) {
-            if (markCountExceeded(tech_pvt)) {
-              switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "(%u) processIncomingMessage - 标记数量超限，丢弃标记 %s\n", tech_pvt->id, cJSON_GetStringValue(name));
+            bool dropMark = false;
+            if (tech_pvt->mutex) switch_mutex_lock(tech_pvt->mutex);
+            if (!sessionBugStillActive(session, tech_pvt)) {
+              if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
+              cJSON_Delete(json);
+              return;
             }
-            else {
+            dropMark = markCountExceeded(tech_pvt);
+            if (!dropMark) {
               if (nullptr == tech_pvt->pVecMarksInInventory) {
                 tech_pvt->pVecMarksInInventory = static_cast<void *>(new std::deque<std::string>());
                 tech_pvt->pVecMarksInUse = static_cast<void *>(new std::deque<std::string>());
                 tech_pvt->pVecMarksCleared = static_cast<void *>(new std::deque<std::string>());
               }
               std::deque<std::string>* pVec = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInInventory);
-              if (tech_pvt->mutex) switch_mutex_lock(tech_pvt->mutex);
               pVec->push_back(name->valuestring);
-              if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
+            }
+            if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
+            if (dropMark) {
+              switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "(%u) processIncomingMessage - 标记数量超限，丢弃标记 %s\n", tech_pvt->id, cJSON_GetStringValue(name));
             }
           }
         }
       }
       else if (0 == type.compare("clearMarks")) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "(%u) processIncomingMessage - 收到clearMarks\n", tech_pvt->id);
-        if (nullptr != tech_pvt->pVecMarksInInventory) {
-          if (tech_pvt->mutex) switch_mutex_lock(tech_pvt->mutex);
+        if (tech_pvt->mutex) switch_mutex_lock(tech_pvt->mutex);
+        if (sessionBugStillActive(session, tech_pvt) && nullptr != tech_pvt->pVecMarksInInventory) {
           std::deque<std::string>* pVecMarksInInventory = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInInventory);
           std::deque<std::string>* pVecMarksInUse = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksInUse);
           std::deque<std::string>* pVecMarksCleared = static_cast<std::deque<std::string>*>(tech_pvt->pVecMarksCleared);
@@ -339,8 +413,8 @@ namespace {
           pVecMarksCleared->insert(pVecMarksCleared->end(), pVecMarksInInventory->begin(), pVecMarksInInventory->end());
           pVecMarksInInventory->clear();
           pVecMarksInUse->clear();
-          if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
         }
+        if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
       }
       else if (0 == type.compare("transcription")) {
         char* jsonString = cJSON_PrintUnformatted(jsonData);
@@ -385,6 +459,10 @@ namespace {
       if (bug) {
         private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
         if (tech_pvt) {
+          if (switch_channel_get_private(channel, bugname) != bug) {
+            switch_core_session_rwunlock(session);
+            return;
+          }
           switch (event) {
             case drachtio::AudioPipe::CONNECT_SUCCESS:
               switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "连接成功\n");
@@ -392,8 +470,10 @@ namespace {
               if (strlen(tech_pvt->initialMetadata) > 0) {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "发送初始元数据 %s\n", tech_pvt->initialMetadata);
                 if (tech_pvt->mutex) switch_mutex_lock(tech_pvt->mutex);
-                drachtio::AudioPipe *pAudioPipe = static_cast<drachtio::AudioPipe *>(tech_pvt->pAudioPipe);
-                if (pAudioPipe) pAudioPipe->bufferForSending(tech_pvt->initialMetadata);
+                if (switch_channel_get_private(channel, bugname) == bug) {
+                  drachtio::AudioPipe *pAudioPipe = static_cast<drachtio::AudioPipe *>(tech_pvt->pAudioPipe);
+                  if (pAudioPipe) pAudioPipe->bufferForSending(tech_pvt->initialMetadata);
+                }
                 if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
               }
             break;
@@ -480,7 +560,6 @@ namespace {
     tech_pvt->buffer_overrun_notified = 0;
     tech_pvt->audio_paused = 0;
     tech_pvt->graceful_shutdown = 0;
-    tech_pvt->streamingPlayoutBuffer = (void *) new CircularBuffer_t(8192);
     tech_pvt->bidirectional_audio_enable = bidirectional_audio_enable;
     tech_pvt->bidirectional_audio_stream = bidirectional_audio_stream;
     tech_pvt->bidirectional_audio_sample_rate = bidirectional_audio_sample_rate;
@@ -494,7 +573,14 @@ namespace {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "降采样因子为 %d\n", tech_pvt->downscale_factor);
     }
     tech_pvt->streamingPreBufSize = 320 * tech_pvt->downscale_factor * 6; // 最小120ms预缓冲
-    tech_pvt->streamingPreBuffer = (void *) new CircularBuffer_t(8192);
+    {
+      size_t playoutCapacity = std::min((size_t)MAX_CIRCULAR_BUFFER_CAPACITY,
+        std::max((size_t)8192, (size_t)sampling * (size_t)nAudioBufferSecs));
+      size_t preBufferCapacity = std::min((size_t)MAX_CIRCULAR_BUFFER_CAPACITY,
+        std::max((size_t)8192, (size_t)tech_pvt->streamingPreBufSize * 4));
+      tech_pvt->streamingPlayoutBuffer = (void *) new CircularBuffer_t(playoutCapacity);
+      tech_pvt->streamingPreBuffer = (void *) new CircularBuffer_t(preBufferCapacity);
+    }
     tech_pvt->pVecMarksInInventory = nullptr;
     tech_pvt->pVecMarksInUse = nullptr;
     tech_pvt->pVecMarksCleared = nullptr;
@@ -548,6 +634,11 @@ namespace {
 
   void destroy_tech_pvt(private_t* tech_pvt) {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "%s (%u) destroy_tech_pvt\n", tech_pvt->sessionId, tech_pvt->id);
+    if (tech_pvt->pAudioPipe) {
+      drachtio::AudioPipe *pAudioPipe = static_cast<drachtio::AudioPipe *>(tech_pvt->pAudioPipe);
+      tech_pvt->pAudioPipe = nullptr;
+      pAudioPipe->closeAndDestroy();
+    }
     if (tech_pvt->resampler) {
       speex_resampler_destroy(tech_pvt->resampler);
       tech_pvt->resampler = nullptr;
@@ -560,10 +651,9 @@ namespace {
       switch_core_codec_destroy(&tech_pvt->raw_write_codec);
       tech_pvt->raw_write_codec_initialized = 0;
     }
-    if (tech_pvt->mutex) {
-      switch_mutex_destroy(tech_pvt->mutex);
-      tech_pvt->mutex = nullptr;
-    }
+    // tech_pvt is session-pool allocated; leave the mutex to the pool so any
+    // concurrent lws callback that already found the media bug can finish
+    // acquiring it, re-check channel ownership, and exit safely.
     if (tech_pvt->streamingPlayoutBuffer) {
       CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
       delete cBuffer;
@@ -587,15 +677,9 @@ namespace {
       delete static_cast<std::vector<std::pair<size_t, std::string>>*>(tech_pvt->pMarkerPositions);
       tech_pvt->pMarkerPositions = nullptr;
     }
-    if (tech_pvt->pAudioPipe) {
-      drachtio::AudioPipe *pAudioPipe = static_cast<drachtio::AudioPipe *>(tech_pvt->pAudioPipe);
-      drachtio::AudioPipe::removeFromPendingLists(pAudioPipe);
-      delete pAudioPipe;
-      tech_pvt->pAudioPipe = nullptr;
-    }
   }
 
-  static void send_mark_event(private_t* tech_pvt, const char* name, int cleared = false) {
+  static void send_mark_event(private_t* tech_pvt, const char* name, int cleared) {
     std::ostringstream json;
     json << "{\"type\": \"mark\", \"data\": {\"name\":\"" << name << "\", ";
     if (cleared) json << "\"event\": \"cleared\"}}";
@@ -684,12 +768,14 @@ extern "C" {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "parse_ws_uri - %d: %s\n", i, matches[i].str().c_str());
       }
       */
-      strncpy(host, matches[1].str().c_str(), MAX_WS_URL_LEN);
+      strncpy(host, matches[1].str().c_str(), MAX_WS_URL_LEN - 1);
+      host[MAX_WS_URL_LEN - 1] = '\0';
       if (matches[2].str().length() > 0) {
         *pPort = atoi(matches[2].str().c_str());
       }
       if (matches[3].str().length() > 0) {
-        strncpy(path, matches[3].str().c_str(), MAX_PATH_LEN);
+        strncpy(path, matches[3].str().c_str(), MAX_PATH_LEN - 1);
+        path[MAX_PATH_LEN - 1] = '\0';
       }
       else {
         strcpy(path, "/");
@@ -785,6 +871,7 @@ extern "C" {
     if (tech_pvt->mutex) switch_mutex_lock(tech_pvt->mutex);
 
     drachtio::AudioPipe *pAudioPipe = static_cast<drachtio::AudioPipe *>(tech_pvt->pAudioPipe);
+    tech_pvt->pAudioPipe = nullptr;
 
     // 在加锁后重新获取bug
     {
@@ -808,7 +895,7 @@ extern "C" {
     }
 
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
-    if (pAudioPipe) pAudioPipe->close();
+    if (pAudioPipe) pAudioPipe->closeAndDestroy();
     if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
     destroy_tech_pvt(tech_pvt);
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup：连接已关闭\n", id);
@@ -926,8 +1013,17 @@ extern "C" {
         frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
         while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
           if (frame.datalen) {
-            spx_uint32_t out_len = available >> 1;  // 每个2字节采样的空间
+            spx_uint32_t out_len = available / (sizeof(int16_t) * tech_pvt->channels);
             spx_uint32_t in_len = frame.samples;
+            if (out_len == 0) {
+              if (!tech_pvt->buffer_overrun_notified) {
+                tech_pvt->buffer_overrun_notified = 1;
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) 正在丢弃数据包！\n",
+                  tech_pvt->id);
+                tech_pvt->responseHandler(session, EVENT_BUFFER_OVERRUN, NULL);
+              }
+              break;
+            }
 
             speex_resampler_process_interleaved_int(tech_pvt->resampler,
               (const spx_int16_t *) frame.data,
@@ -936,8 +1032,7 @@ extern "C" {
               &out_len);
 
             if (out_len > 0) {
-              // 写入字节数 = 采样数 * 2 * 声道数
-              size_t bytes_written = out_len << tech_pvt->channels;
+              size_t bytes_written = (size_t)out_len * sizeof(int16_t) * tech_pvt->channels;
               pAudioPipe->binaryWritePtrAdd(bytes_written);
               available = pAudioPipe->binarySpaceAvailable();
             }
@@ -965,6 +1060,7 @@ switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
 
     static std::atomic<uint32_t> call_count{0};
     static std::atomic<uint32_t> underrun_count{0};
+    std::vector<std::pair<std::string, int>> pendingMarkEvents;
     call_count.fetch_add(1, std::memory_order_relaxed);
 
     // 使用阻塞锁 - 对同步至关重要
@@ -973,7 +1069,7 @@ switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
     CircularBuffer_t *cBuffer = (CircularBuffer_t *) tech_pvt->streamingPlayoutBuffer;
 
     if ((call_count.load(std::memory_order_relaxed) % 50) == 0) {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
                          "(%u) 系统活跃 #%u：缓冲区=%zu 采样，欠载=%u\n",
                          tech_pvt->id, call_count.load(std::memory_order_relaxed), cBuffer->size(), underrun_count.load(std::memory_order_relaxed));
     }
@@ -996,7 +1092,7 @@ switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
                 for (auto it = vec.begin(); it != vec.end(); ++it) {
                     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
                                      "(%u) 标记 %s 已清除\n", tech_pvt->id, it->c_str());
-                    send_mark_event(tech_pvt, it->c_str(), true);
+                    pendingMarkEvents.push_back({*it, true});
                 }
 
                 pVecMarksCleared->insert(pVecMarksCleared->end(), pVecMarksInUse->begin(), pVecMarksInUse->end());
@@ -1020,6 +1116,9 @@ switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
                 int16_t data[MAX_DUB_FRAME_SAMPLES];
                 if (samples_needed > MAX_DUB_FRAME_SAMPLES) {
                     switch_mutex_unlock(tech_pvt->mutex);
+                    for (auto& markEvent : pendingMarkEvents) {
+                        send_mark_event(tech_pvt, markEvent.first.c_str(), markEvent.second);
+                    }
                     return SWITCH_TRUE;
                 }
                 memset(data, 0, samples_needed * sizeof(int16_t));
@@ -1031,7 +1130,7 @@ switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
                     auto* markers = static_cast<std::vector<std::pair<size_t, std::string>>*>(tech_pvt->pMarkerPositions);
                     for (auto it = markers->begin(); it != markers->end(); ) {
                         if (it->first < (size_t)samplesToCopy) {
-                            send_mark_event(tech_pvt, it->second.c_str(), false);
+                            pendingMarkEvents.push_back({it->second, false});
                             it = markers->erase(it);
                         } else {
                             it->first -= samplesToCopy;
@@ -1060,6 +1159,9 @@ switch_bool_t dub_speech_frame(switch_media_bug_t *bug, private_t* tech_pvt) {
     }
 
     switch_mutex_unlock(tech_pvt->mutex);
+    for (auto& markEvent : pendingMarkEvents) {
+        send_mark_event(tech_pvt, markEvent.first.c_str(), markEvent.second);
+    }
     return SWITCH_TRUE;
 }
 
