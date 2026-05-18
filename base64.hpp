@@ -1,33 +1,32 @@
 /*
     ******
-    base64.hpp is a repackaging of the base64.cpp and base64.h files into a
-    single header suitable for use as a header only library. This conversion was
-    done by Peter Thorson (webmaster@zaphoyd.com) in 2012. All modifications to
-    the code are redistributed under the same license as the original, which is
-    listed below.
+    base64.hpp 是将 base64.cpp 和 base64.h 文件重新打包为
+    单一头文件的版本，适合作为仅头文件库使用。此转换由
+    Peter Thorson (webmaster@zaphoyd.com) 于 2012 年完成。
+    所有代码修改均按照与原始代码相同的许可证重新分发，
+    原始许可证如下所示。
     ******
 
-   base64.cpp and base64.h
+   base64.cpp 和 base64.h
 
-   Copyright (C) 2004-2008 René Nyffenegger
+   版权所有 (C) 2004-2008 René Nyffenegger
 
-   This source code is provided 'as-is', without any express or implied
-   warranty. In no event will the author be held liable for any damages
-   arising from the use of this software.
+   本源代码按"原样"提供，不附带任何明示或暗示的
+   保证。在任何情况下，作者均不对因使用本软件而
+   造成的任何损害承担责任。
 
-   Permission is granted to anyone to use this software for any purpose,
-   including commercial applications, and to alter it and redistribute it
-   freely, subject to the following restrictions:
+   特此授权任何人出于任何目的使用本软件，包括
+   商业应用，并可自由修改和重新分发，但须遵守
+   以下限制：
 
-   1. The origin of this source code must not be misrepresented; you must not
-      claim that you wrote the original source code. If you use this source code
-      in a product, an acknowledgment in the product documentation would be
-      appreciated but is not required.
+   1. 不得歪曲本源代码的来源；不得声称您编写了
+      原始源代码。如果您在产品中使用本源代码，
+      建议在产品文档中致谢，但这并非必须。
 
-   2. Altered source versions must be plainly marked as such, and must not be
-      misrepresented as being the original source code.
+   2. 修改后的源代码版本必须明确标注为修改版本，
+      且不得歪曲为原始源代码。
 
-   3. This notice may not be removed or altered from any source distribution.
+   3. 不得从任何源代码分发中删除或修改本声明。
 
    René Nyffenegger rene.nyffenegger@adp-gmbh.ch
 
@@ -45,10 +44,10 @@ static std::string const base64_chars =
              "abcdefghijklmnopqrstuvwxyz"
              "0123456789+/";
 
-/// Test whether a character is a valid base64 character
+/// 测试字符是否为有效的 base64 字符
 /**
- * @param c The character to test
- * @return true if c is a valid base64 character
+ * @param c 要测试的字符
+ * @return 如果 c 是有效的 base64 字符则返回 true
  */
 static inline bool is_base64(unsigned char c) {
     return (c == 43 || // +
@@ -57,11 +56,11 @@ static inline bool is_base64(unsigned char c) {
            (c >= 97 && c <= 122)); // a-z
 }
 
-/// Encode a char buffer into a base64 string
+/// 将字符缓冲区编码为 base64 字符串
 /**
- * @param input The input data
- * @param len The length of input in bytes
- * @return A base64 encoded string representing input
+ * @param input 输入数据
+ * @param len 输入数据的字节长度
+ * @return 表示输入数据的 base64 编码字符串
  */
 inline std::string base64_encode(unsigned char const * input, size_t len) {
     std::string ret;
@@ -111,10 +110,10 @@ inline std::string base64_encode(unsigned char const * input, size_t len) {
     return ret;
 }
 
-/// Encode a string into a base64 string
+/// 将字符串编码为 base64 字符串
 /**
- * @param input The input data
- * @return A base64 encoded string representing input
+ * @param input 输入数据
+ * @return 表示输入数据的 base64 编码字符串
  */
 inline std::string base64_encode(std::string const & input) {
     return base64_encode(
@@ -123,10 +122,10 @@ inline std::string base64_encode(std::string const & input) {
     );
 }
 
-/// Decode a base64 encoded string into a string of raw bytes
+/// 将 base64 编码的字符串解码为原始字节字符串
 /**
- * @param input The base64 encoded input data
- * @return A string representing the decoded raw bytes
+ * @param input base64 编码的输入数据
+ * @return 表示解码后原始字节的字符串
  */
 inline std::string base64_decode(std::string const & input) {
     size_t in_len = input.size();
