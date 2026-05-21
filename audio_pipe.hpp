@@ -108,6 +108,7 @@ namespace drachtio {
     static std::mutex mutex_disconnects;
     static std::mutex mutex_writes;
     static std::list<AudioPipe*> pendingConnects;
+    static std::unordered_map<struct lws*, AudioPipe*> pendingConnectsByWsi;
     static std::list<AudioPipe*> pendingDisconnects;
     static std::list<AudioPipe*> pendingWrites;
     static log_emit_function logger;

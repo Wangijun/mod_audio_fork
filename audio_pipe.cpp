@@ -360,6 +360,7 @@ std::mutex AudioPipe::mutex_connects;
 std::mutex AudioPipe::mutex_disconnects;
 std::mutex AudioPipe::mutex_writes;
 std::list<AudioPipe*> AudioPipe::pendingConnects;
+std::unordered_map<struct lws*, AudioPipe*> AudioPipe::pendingConnectsByWsi;
 std::list<AudioPipe*> AudioPipe::pendingDisconnects;
 std::list<AudioPipe*> AudioPipe::pendingWrites;
 AudioPipe::log_emit_function AudioPipe::logger;
@@ -383,11 +384,16 @@ void AudioPipe::processPendingConnects(lws_per_vhost_data *vhd) {
       {
         std::lock_guard<std::mutex> guard(mutex_connects);
         pendingConnects.remove(ap);
+        if (ap->m_wsi) pendingConnectsByWsi.erase(ap->m_wsi);
       }
       ap->m_state.store(LWS_CLIENT_FAILED, std::memory_order_release);
       ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::CONNECT_FAIL,
         "lws_client_connect_via_info returned null", NULL, 0);
       delete ap;
+    }
+    else {
+      std::lock_guard<std::mutex> guard(mutex_connects);
+      pendingConnects.remove(ap);
     }
   }
 }
@@ -397,13 +403,24 @@ void AudioPipe::processPendingDisconnects(lws_per_vhost_data * /*vhd*/) {
   {
     std::lock_guard<std::mutex> guard(mutex_disconnects);
     for (auto it = pendingDisconnects.begin(); it != pendingDisconnects.end(); ++it) {
-      if ((*it)->m_state.load(std::memory_order_acquire) == LWS_CLIENT_DISCONNECTING) disconnects.push_back(*it);
+      LwsState_t state = (*it)->m_state.load(std::memory_order_acquire);
+      if (state == LWS_CLIENT_DISCONNECTING ||
+        (state == LWS_CLIENT_CONNECTING && (*it)->m_delete_on_close.load(std::memory_order_acquire))) {
+        disconnects.push_back(*it);
+      }
     }
     pendingDisconnects.clear();
   }
   for (auto it = disconnects.begin(); it != disconnects.end(); ++it) {
     AudioPipe* ap = *it;
-    if (ap->m_wsi) lws_callback_on_writable(ap->m_wsi);
+    if (ap->m_wsi) {
+      if (ap->m_state.load(std::memory_order_acquire) == LWS_CLIENT_CONNECTING) {
+        lws_set_timeout(ap->m_wsi, PENDING_TIMEOUT_USER_OK, LWS_TO_KILL_ASYNC);
+      }
+      else {
+        lws_callback_on_writable(ap->m_wsi);
+      }
+    }
   }
 }
 
@@ -426,6 +443,19 @@ AudioPipe* AudioPipe::findAndRemovePendingConnect(struct lws *wsi) {
   AudioPipe* ap = NULL;
   std::lock_guard<std::mutex> guard(mutex_connects);
   std::list<AudioPipe* > toRemove;
+
+  auto indexed = pendingConnectsByWsi.find(wsi);
+  if (indexed != pendingConnectsByWsi.end()) {
+    ap = indexed->second;
+    pendingConnectsByWsi.erase(indexed);
+  }
+  else {
+    AudioPipe* opaque = static_cast<AudioPipe*>(lws_get_opaque_user_data(wsi));
+    if (opaque && opaque->m_wsi == wsi &&
+      opaque->m_state.load(std::memory_order_acquire) == LWS_CLIENT_CONNECTING) {
+      ap = opaque;
+    }
+  }
 
   for (auto it = pendingConnects.begin(); it != pendingConnects.end() && !ap; ++it) {
     int state = (*it)->m_state.load(std::memory_order_acquire);
@@ -451,6 +481,18 @@ AudioPipe* AudioPipe::findPendingConnect(struct lws *wsi) {
   AudioPipe* ap = NULL;
   std::lock_guard<std::mutex> guard(mutex_connects);
 
+  auto indexed = pendingConnectsByWsi.find(wsi);
+  if (indexed != pendingConnectsByWsi.end()) {
+    ap = indexed->second;
+  }
+  else {
+    AudioPipe* opaque = static_cast<AudioPipe*>(lws_get_opaque_user_data(wsi));
+    if (opaque && opaque->m_wsi == wsi &&
+      opaque->m_state.load(std::memory_order_acquire) == LWS_CLIENT_CONNECTING) {
+      ap = opaque;
+    }
+  }
+
   for (auto it = pendingConnects.begin(); it != pendingConnects.end() && !ap; ++it) {
     int state = (*it)->m_state.load(std::memory_order_acquire);
     if ((state == LWS_CLIENT_CONNECTING) &&
@@ -469,7 +511,9 @@ void AudioPipe::addPendingConnect(AudioPipe* ap) {
   if (context) lws_cancel_service(context);
 }
 void AudioPipe::addPendingDisconnect(AudioPipe* ap) {
-  ap->m_state.store(LWS_CLIENT_DISCONNECTING, std::memory_order_release);
+  if (ap->m_state.load(std::memory_order_acquire) != LWS_CLIENT_CONNECTING) {
+    ap->m_state.store(LWS_CLIENT_DISCONNECTING, std::memory_order_release);
+  }
   {
     std::lock_guard<std::mutex> guard(mutex_disconnects);
     pendingDisconnects.push_back(ap);
@@ -502,6 +546,7 @@ void AudioPipe::removeFromPendingLists(AudioPipe* ap) {
   {
     std::lock_guard<std::mutex> guard(mutex_connects);
     pendingConnects.remove(ap);
+    if (ap->m_wsi) pendingConnectsByWsi.erase(ap->m_wsi);
   }
   {
     std::lock_guard<std::mutex> guard(mutex_disconnects);
@@ -592,7 +637,7 @@ AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, cons
   m_sslFlags(sslFlags), m_wsi(nullptr), m_audio_buffer_max_len(bufLen),
   m_audio_buffer_write_offset(LWS_PRE), m_audio_buffer_min_freespace(minFreespace),
   m_recv_buf(nullptr), m_recv_buf_ptr(nullptr),
-  m_vhd(nullptr), m_callback(callback), m_gracefulShutdown(false),
+  m_recv_buf_len(0), m_vhd(nullptr), m_callback(callback), m_gracefulShutdown(false),
   m_delete_on_close(false), m_write_pending(false) {
 
   if (username && password) {
@@ -621,11 +666,9 @@ void AudioPipe::closeAndDestroy(void) {
   }
 
   if (state == LWS_CLIENT_DISCONNECTING || state == LWS_CLIENT_CONNECTING) {
-    if (m_vhd) {
-      lws_cancel_service(m_vhd->context);
-    } else if (context) {
-      lws_cancel_service(context);
-    }
+    if (state == LWS_CLIENT_CONNECTING) addPendingDisconnect(this);
+    else if (m_vhd) lws_cancel_service(m_vhd->context);
+    else if (context) lws_cancel_service(context);
     return;
   }
 
@@ -649,11 +692,16 @@ bool AudioPipe::connect_client(struct lws_per_vhost_data *vhd) {
   i.ssl_connection = m_sslFlags;
   i.protocol = protocolName.c_str();
   i.pwsi = &(m_wsi);
+  i.opaque_user_data = this;
 
   m_state.store(LWS_CLIENT_CONNECTING, std::memory_order_release);
   m_vhd = vhd;
 
   m_wsi = lws_client_connect_via_info(&i);
+  if (m_wsi) {
+    std::lock_guard<std::mutex> guard(mutex_connects);
+    pendingConnectsByWsi[m_wsi] = this;
+  }
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,"%s 尝试连接，wsi 为 %p\n", m_uuid.c_str(), m_wsi);
 
   return nullptr != m_wsi;
