@@ -89,10 +89,19 @@ static switch_status_t start_capture(switch_core_session_t *session,
 		return SWITCH_STATUS_FALSE;
 	}
 
-	read_codec = switch_core_session_get_read_codec(session);
+	if (!switch_channel_ready(channel)) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 通道未就绪，无法启动监听器 %s!\n", bugname);
+		return SWITCH_STATUS_FALSE;
+	}
 
 	if (switch_channel_pre_answer(channel) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 通道必须达到预应答状态后才能调用 start!\n");
+		return SWITCH_STATUS_FALSE;
+	}
+
+	read_codec = switch_core_session_get_read_codec(session);
+	if (!read_codec || !read_codec->implementation) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 通道没有可用的读取 codec，无法启动监听器 %s!\n", bugname);
 		return SWITCH_STATUS_FALSE;
 	}
 
