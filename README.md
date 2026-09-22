@@ -1,12 +1,16 @@
 # mod_audio_fork
 
-一个 FreeSWITCH 模块，用于在通道上挂载媒体监听器，并通过 WebSocket 将 L16 音频流传输到远程服务器。本模块支持**双向音频** — 可以从服务器接收音频并实时回放给通话方，实现完整的 IVR、对话和语音机器人应用。
+一个 FreeSWITCH 模块，用于在通道上挂载媒体监听器，并通过 WebSocket 将 L16 音频流传输到远程服务器。同时支持**原生下行流式播放** — 注册 `SWITCH_FILE_INTERFACE` 文件驱动（`audio_fork://`），可直接通过 HTTP Chunked 模式拉取并播放裸线性 PCM16 音频流，作为 `mod_shout` 的现代高性能零编解码替代方案。
 
 ## 功能特性
 
-- **双向音频** — 将音频流传输到 WebSocket 服务器，并接收音频进行实时回放
-- **二进制音频流** — 从服务器接收原始二进制音频帧（除 base64 编码的 JSON 外）
-- **音频标记** — 通过命名标记同步音频播放（`mark` / `clearMarks`）
+- **上行流式分流** — 将音频流通过 WebSocket 实时传输到远程 ASR 识别服务器
+- **下行流式播放** — 原生 `SWITCH_FILE_INTERFACE` 文件驱动，直接拉取 HTTP Chunked PCM16 流播放
+- **零编解码延迟** — 下行裸 PCM16 直接送入信道，彻底消除 MP3 编解码延迟与 CPU 消耗
+- **严格整采样对齐** — 读写缓冲均按整采样边界对齐，彻底杜绝奇数字节截断白噪音
+- **起播预缓冲与时钟防抖** — 默认 200ms 起播预缓冲，欠载自动补静音维持 20ms RTP 时钟
+- **尾音排空确认** — 传输结束且缓冲区读空后持续 3 帧确认排空，杜绝吞尾字
+- **秒级极速打断** — 关闭播放时主动 shutdown 套接字，瞬间解除 curl 阻塞极速释放
 - **多种混音类型** — 单声道（仅主叫）、混合（主叫 + 被叫）或立体声（独立声道）
 - **灵活的采样率** — 8000、16000、24000、32000、48000、64000 Hz（8000 的任意整数倍）
 - **自动重采样** — 内置 Speex 重采样器，用于采样率转换
@@ -34,18 +38,20 @@
 
 ## API
 
-### 命令语法
+### 1. 上行分流命令 (`uuid_audio_fork`)
+
+#### 命令语法
 
 ```
 uuid_audio_fork <uuid> <command> [arguments...]
 ```
 
-### 命令
+#### 命令
 
-#### start
+##### start
 
 ```
-uuid_audio_fork <uuid> start <wss-url> <mix-type> <sampling-rate> [bugname] [metadata] [bidirectionalAudio_enabled] [bidirectionalAudio_stream_enabled] [bidirectionalAudio_stream_samplerate]
+uuid_audio_fork <uuid> start <wss-url> <mix-type> <sampling-rate> [bugname] [metadata]
 ```
 
 挂载媒体监听器并开始将音频流传输到 WebSocket 服务器。
@@ -53,16 +59,13 @@ uuid_audio_fork <uuid> start <wss-url> <mix-type> <sampling-rate> [bugname] [met
 | 参数 | 描述 |
 |---|---|
 | `uuid` | FreeSWITCH 通道 UUID |
-| `wss-url` | WebSocket URL（`ws://`、`wss://`、`http://` 或 `https://`） |
+| `wss-url` | WebSocket URL（`ws://` 或 `wss://`） |
 | `mix-type` | `mono`（仅主叫）、`mixed`（主叫 + 被叫）或 `stereo`（独立声道） |
 | `sampling-rate` | `8k`、`16k` 或 8000 的任意整数倍（如 `24000`、`32000`、`64000`） |
 | `bugname` | 可选的监听器名称，用于多个并发分流（默认：`audio_fork`） |
 | `metadata` | 可选的 JSON 元数据，连接建立后立即作为文本帧发送 |
-| `bidirectionalAudio_enabled` | `true` 或 `false` — 启用从服务器接收音频（默认：`true`） |
-| `bidirectionalAudio_stream_enabled` | `true` 或 `false` — 启用来自服务器的二进制音频流 |
-| `bidirectionalAudio_stream_samplerate` | 来自服务器的输入音频采样率（如 `8000`、`16000`） |
 
-#### stop
+##### stop
 
 ```
 uuid_audio_fork <uuid> stop [bugname] [metadata]
@@ -70,7 +73,7 @@ uuid_audio_fork <uuid> stop [bugname] [metadata]
 
 关闭 WebSocket 连接并卸载媒体监听器。可选在关闭前发送最终的文本帧。
 
-#### send_text
+##### send_text
 
 ```
 uuid_audio_fork <uuid> send_text [bugname] <text>
@@ -78,7 +81,7 @@ uuid_audio_fork <uuid> send_text [bugname] <text>
 
 向远程服务器发送文本帧（如 DTMF 事件、控制消息）。
 
-#### pause
+##### pause
 
 ```
 uuid_audio_fork <uuid> pause [bugname]
@@ -86,7 +89,7 @@ uuid_audio_fork <uuid> pause [bugname]
 
 暂停音频流传输（帧将被丢弃）。
 
-#### resume
+##### resume
 
 ```
 uuid_audio_fork <uuid> resume [bugname]
@@ -94,7 +97,7 @@ uuid_audio_fork <uuid> resume [bugname]
 
 在暂停后恢复音频流传输。
 
-#### graceful-shutdown
+##### graceful-shutdown
 
 ```
 uuid_audio_fork <uuid> graceful-shutdown [bugname]
@@ -102,15 +105,41 @@ uuid_audio_fork <uuid> graceful-shutdown [bugname]
 
 启动优雅关闭 — 停止发送新音频，但允许缓冲的音频在关闭前排空。
 
-#### stop_play
+---
+
+### 2. 下行原生流式播放驱动 (`audio_fork://`)
+
+注册 FreeSWITCH 原生 `SWITCH_FILE_INTERFACE` 文件驱动（协议头 `audio_fork://`），通过 HTTP Chunked 异步拉取裸线性 PCM16 流并播放。
+
+#### 语法格式
 
 ```
-uuid_audio_fork <uuid> stop_play [bugname]
+playback(audio_fork://http[s]://<host>:<port>/<path>[?query_parameters])
 ```
 
-通过清空播放缓冲区来停止当前音频播放。
+#### 支持的 URL 查询参数
 
-### 事件
+| 参数名 | 描述 | 默认值 | 取值范围与说明 |
+|---|---|---|---|
+| `rate` / `sampling` | 音频采样率 (Hz) | `16000` | `8000` ~ `48000`（FreeSWITCH 核心按此采样率与通道自动重采样） |
+| `channels` | 音频声道数 | `1` | `1`（单声道 Mono）或 `2`（立体声 Stereo） |
+| `prebuffer` | 起播预缓冲时长 (ms) | `200` | `1` ~ `2000` 毫秒。积攒指定毫秒数据后即刻秒起播，杜绝欠载斩波 |
+| `watchdog` | 静音看门狗超时时间 (ms) | `3000` | 连续无数据输入达此时长后安全退出播放；设为 `0` 可关闭看门狗 |
+
+#### 调用示例
+
+```bash
+# 在 fs_cli 中直接向通道播放实时 HTTP PCM 流
+fs_cli -x "uuid_broadcast <uuid> audio_fork://http://127.0.0.1:9080/tts-stream/140581e86ae8eff9.pcm?rate=16000&channels=1 aleg"
+
+# 在 Outbound ESL (Node/Bun) 中下发播放指令
+await session.execute("playback", "audio_fork://http://127.0.0.1:9080/tts-stream/xxx.pcm?rate=16000&channels=1");
+
+# 配合 uuid_break 毫秒级打断播放
+fs_cli -x "uuid_break <uuid> all"
+```
+
+## 事件
 
 本模块生成以下 FreeSWITCH 自定义事件：
 
@@ -126,91 +155,6 @@ uuid_audio_fork <uuid> stop_play [bugname]
 | `mod_audio_fork::kill_audio` | 服务器请求停止当前音频播放 |
 | `mod_audio_fork::error` | 服务器报告了错误 |
 | `mod_audio_fork::json` | 服务器发送了通用 JSON 消息 |
-
-### 服务器到模块的消息
-
-服务器可以发送 JSON 文本帧来控制模块：
-
-#### playAudio
-向通话方回放音频（使用 base64 编码的 JSON 模式时）：
-```json
-{
-  "type": "playAudio",
-  "data": {
-    "audioContentType": "raw",
-    "sampleRate": 8000,
-    "audioContent": "<base64编码的原始音频>"
-  }
-}
-```
-
-#### killAudio
-停止当前音频播放并清空缓冲区：
-```json
-{
-  "type": "killAudio"
-}
-```
-
-#### mark
-添加命名标记用于音频同步：
-```json
-{
-  "type": "mark",
-  "data": {
-    "name": "marker-name"
-  }
-}
-```
-当播放到达标记时，模块会向服务器发送标记事件。最多可排队 30 个标记。
-
-#### clearMarks
-清除所有待处理的标记：
-```json
-{
-  "type": "clearMarks"
-}
-```
-
-#### transcription
-```json
-{
-  "type": "transcription",
-  "data": { ... }
-}
-```
-
-#### transfer
-```json
-{
-  "type": "transfer",
-  "data": { ... }
-}
-```
-
-#### disconnect
-```json
-{
-  "type": "disconnect",
-  "data": { ... }
-}
-```
-
-#### error
-```json
-{
-  "type": "error",
-  "data": { ... }
-}
-```
-
-#### 二进制音频流
-
-当 `bidirectionalAudio_stream_enabled` 设置为 `true` 时，服务器可以直接通过 WebSocket 发送原始二进制音频帧（而非 base64 编码的 JSON）。这对实时音频流更高效。模块会处理：
-
-- 如果服务器的采样率与通道采样率不同，自动重采样
-- 预缓冲以平滑网络抖动
-- 音频标记交错以实现同步
 
 ## 构建
 
@@ -232,8 +176,8 @@ sudo ./build.sh install    # 安装到 FreeSWITCH
 ## 使用示例
 
 ```bash
-# 启动双向音频流传输
-fs_cli -x "uuid_audio_fork <uuid> start wss://your-server.com/audio mixed 16k mybug {} true true 16000"
+# 启动上行音频流传输 (ASR)
+fs_cli -x "uuid_audio_fork <uuid> start ws://127.0.0.1:10096 mono 16k mybug {}"
 
 # 发送文本消息
 fs_cli -x "uuid_audio_fork <uuid> send_text mybug {\"event\":\"dtmf\",\"digit\":\"1\"}"
@@ -244,8 +188,11 @@ fs_cli -x "uuid_audio_fork <uuid> pause mybug"
 # 恢复流传输
 fs_cli -x "uuid_audio_fork <uuid> resume mybug"
 
-# 停止并发送最终消息
+# 停止上行流传输
 fs_cli -x "uuid_audio_fork <uuid> stop mybug {\"reason\":\"complete\"}"
+
+# 下行流式播放 (TTS)
+fs_cli -x "uuid_broadcast <uuid> audio_fork://http://127.0.0.1:9080/tts-stream/xxx.pcm?rate=16000&channels=1 aleg"
 ```
 
 ## 许可证

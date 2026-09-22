@@ -157,13 +157,15 @@ int AudioPipe::lws_callback(struct lws *wsi,
         }
 
         if (lws_frame_is_binary(wsi)) {
-          if (len > 0 && ap->is_bidirectional_audio_stream()) {
+          if (ap->is_bidirectional_audio_stream()) {
+            if (len == 0) {
+              switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "AudioPipe::lws_service_thread (%s) 收到零长二进制帧 (EOF 定稿标记)\n", ap->m_uuid.c_str());
+            }
             ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::BINARY, NULL, (char *) in, len);
           } else if (len > 0) {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_RECEIVE 收到意外的二进制帧，丢弃。\n");
-          }
-          else {
-            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,"AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_RECEIVE 收到零长度二进制帧，丢弃。\n");
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "AudioPipe::lws_service_thread (%s) 收到意外的二进制帧（双向流未启用），丢弃。\n", ap->m_uuid.c_str());
+          } else {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "AudioPipe::lws_service_thread (%s) 收到零长度二进制帧，丢弃。\n", ap->m_uuid.c_str());
           }
         }
         else {

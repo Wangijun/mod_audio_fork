@@ -20,6 +20,7 @@ set(FREESWITCH_SEARCH_PATHS
     /usr/include
     /usr/local/include
     /opt/freeswitch/include
+    /data/docker_fs_server/freeswitch-install/include/freeswitch
 )
 
 find_path(FREESWITCH_INCLUDE_DIR switch.h
@@ -38,6 +39,7 @@ set(FREESWITCH_LIB_SEARCH_PATHS
     /usr/local/lib
     /opt/freeswitch/lib
     /usr/lib/freeswitch
+    /data/docker_fs_server/freeswitch-install/lib
 )
 
 find_library(FREESWITCH_LIBRARY
@@ -101,25 +103,14 @@ if(NOT SPEEXDSP_LIBRARY)
     endif()
 endif()
 
-# 查找 boost - Ubuntu 22.04 特定
-find_package(Boost REQUIRED COMPONENTS system thread)
-
-# 查找 boost circular_buffer（仅头文件）- Ubuntu 22.04 路径
-find_path(BOOST_INCLUDE_DIR boost/circular_buffer.hpp
-    PATHS
-    /usr/include
-    /usr/local/include
-    /opt/homebrew/include
-    NO_DEFAULT_PATH
-)
-
-if(NOT BOOST_INCLUDE_DIR)
-    find_path(BOOST_INCLUDE_DIR boost/circular_buffer.hpp)
-endif()
+# 查找 libcurl (用于 HTTP Chunked PCM 流式拉取)
+find_package(CURL REQUIRED)
 
 # 设置源文件
 set(MOD_AUDIO_FORK_SOURCES
     mod_audio_fork.c
+    audio_fork_http.c
+    audio_fork_ws.c
     lws_glue.cpp
     parser.cpp
     audio_pipe.cpp
@@ -134,8 +125,7 @@ target_include_directories(mod_audio_fork PRIVATE
     ${FREESWITCH_INCLUDE_DIR}
     ${LIBWEBSOCKETS_INCLUDE_DIRS}
     ${SPEEX_INCLUDE_DIRS}
-    ${BOOST_INCLUDE_DIRS}
-    ${BOOST_INCLUDE_DIR}
+    ${CURL_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -171,13 +161,13 @@ else()
     endif()
 endif()
 
-# 链接库
+# 链接库 (彻底移除 Boost 依赖)
 target_link_libraries(mod_audio_fork
     ${FREESWITCH_LIBRARY}
     ${LIBWEBSOCKETS_LIBRARIES}
     ${SPEEX_LIBRARIES}
     ${SPEEXDSP_LIBRARY}
-    ${Boost_LIBRARIES}
+    ${CURL_LIBRARIES}
     stdc++
     pthread
     dl
@@ -210,8 +200,6 @@ message(STATUS "FreeSWITCH 库: ${FREESWITCH_LIBRARY}")
 message(STATUS "libwebsockets: ${LIBWEBSOCKETS_LIBRARIES}")
 message(STATUS "speex: ${SPEEX_LIBRARIES}")
 message(STATUS "speexdsp: ${SPEEXDSP_LIBRARY}")
-message(STATUS "boost: ${Boost_LIBRARIES}")
-message(STATUS "boost 头文件目录: ${BOOST_INCLUDE_DIR}")
 message(STATUS "构建类型: ${CMAKE_BUILD_TYPE}")
 message(STATUS "C++ 标准: ${CMAKE_CXX_STANDARD}")
 message(STATUS "C 标准: ${CMAKE_C_STANDARD}")

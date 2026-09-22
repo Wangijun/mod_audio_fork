@@ -25,7 +25,7 @@ sudo make install
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y cmake build-essential libwebsockets-dev libboost-all-dev
+sudo apt-get install -y cmake build-essential libwebsockets-dev
 ```
 
 ## 构建
