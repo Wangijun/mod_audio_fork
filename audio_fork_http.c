@@ -295,16 +295,11 @@ switch_status_t audio_fork_http_file_read(switch_file_handle_t *handle, void *da
   switch_mutex_lock(ctx->audio_mutex);
   size_t inuse = ctx->audio_buffer ? switch_buffer_inuse(ctx->audio_buffer) : 0;
 
-  /* 检查排空窗口 (Drain Window)：流结束且缓冲排空后，连续 3 帧确认后优雅退出 */
+  /* 流结束或出错且缓冲已完全排空时，立即优雅退出，绝不注入虚假静音帧延误通道 */
   if (inuse == 0 && (ctx->eof || ctx->err)) {
-    ctx->drain_frames++;
-    if (ctx->drain_frames >= DRAIN_CONFIRM_FRAMES) {
-      switch_mutex_unlock(ctx->audio_mutex);
-      *len = 0;
-      return SWITCH_STATUS_FALSE;
-    }
-  } else {
-    ctx->drain_frames = 0;
+    switch_mutex_unlock(ctx->audio_mutex);
+    *len = 0;
+    return SWITCH_STATUS_FALSE;
   }
 
   if (inuse > 0 && ctx->audio_buffer) {
@@ -319,24 +314,38 @@ switch_status_t audio_fork_http_file_read(switch_file_handle_t *handle, void *da
   }
   switch_mutex_unlock(ctx->audio_mutex);
 
-  /* 缓冲欠载补静音维持 20ms RTP 时钟 */
+  /* 缓冲读取量不足期望量 bytes_needed 的处理 */
   if (bytes_read < bytes_needed) {
-    memset((char *)data + bytes_read, 0, bytes_needed - bytes_read);
-
-    if (!ctx->eof && !ctx->err) {
-      ctx->silence_frames++;
-      if (ctx->max_silence_frames > 0 && ctx->silence_frames > ctx->max_silence_frames) {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-          "[audio_fork] 静音看门狗超时 (%u ms)，中止播放 %s\n",
-          ctx->max_silence_frames * 20, ctx->stream_url);
+    /* 若底层流已结束 (EOF) 或发生错误，说明音频已全部读出，直接返回实际读取的采样数，严禁补 0 填充静音 */
+    if (ctx->eof || ctx->err) {
+      if (bytes_read == 0) {
         *len = 0;
         return SWITCH_STATUS_FALSE;
       }
+      *len = bytes_read / frame_bytes;
+      handle->sample_count += *len;
+      return SWITCH_STATUS_SUCCESS;
     }
-  } else {
-    ctx->silence_frames = 0;
+
+    /* 底层流尚未结束（网络流中途欠载抖动）：补静音维持 20ms RTP 时钟并启动看门狗 */
+    memset((char *)data + bytes_read, 0, bytes_needed - bytes_read);
+
+    ctx->silence_frames++;
+    if (ctx->max_silence_frames > 0 && ctx->silence_frames > ctx->max_silence_frames) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+        "[audio_fork] 静音看门狗超时 (%u ms)，中止播放 %s\n",
+        ctx->max_silence_frames * 20, ctx->stream_url);
+      *len = 0;
+      return SWITCH_STATUS_FALSE;
+    }
+
+    *len = bytes_needed / frame_bytes;
+    handle->sample_count += *len;
+    return SWITCH_STATUS_SUCCESS;
   }
 
+  /* 读满了完整期望数据 */
+  ctx->silence_frames = 0;
   *len = bytes_needed / frame_bytes;
   handle->sample_count += *len;
   return SWITCH_STATUS_SUCCESS;

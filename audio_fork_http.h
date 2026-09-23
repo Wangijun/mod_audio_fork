@@ -10,7 +10,6 @@ extern "C" {
 #endif
 
 #define SILENCE_WATCHDOG_DEFAULT_FRAMES 150  /* 默认连续欠载 150 帧 (3000ms) 触发看门狗强退 */
-#define DRAIN_CONFIRM_FRAMES            3    /* 传输结束且读空后，连续 3 帧确认排空方可终止播放 (防吞字) */
 #define MAX_AUDIO_FORK_BUFFER_BYTES     1600000 /* 约 50 秒 16kHz 16-bit Mono 缓冲硬上限 (防爆内存且杜绝长播报丢帧) */
 #define AUDIO_FORK_PREBUFFER_DEFAULT_MS 200  /* 起播预缓冲默认 200ms (兼顾极速起播与抗抖动，杜绝欠载斩波) */
 
@@ -34,7 +33,6 @@ typedef struct audio_fork_http_ctx {
 
   uint32_t                    silence_frames;    /* 连续静音欠载帧计数 (看门狗) */
   uint32_t                    max_silence_frames;/* 静音看门狗最大帧阈值 */
-  uint32_t                    drain_frames;      /* 排空确认帧计数 (防吞尾音) */
 } audio_fork_http_ctx_t;
 
 switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const char *path);
