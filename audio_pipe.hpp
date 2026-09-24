@@ -6,8 +6,10 @@
 #include <mutex>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <atomic>
 #include <thread>
+#include <cstdint>
 
 #include <libwebsockets.h>
 
@@ -32,7 +34,8 @@ namespace drachtio {
       BINARY
     };
     typedef void (*log_emit_function)(int level, const char *line);
-    typedef void (*notifyHandler_t)(const char *sessionId, const char* bugname, NotifyEvent_t event, const char* message, const char* binary, size_t binary_len );
+    typedef void (*notifyHandler_t)(AudioPipe *pipe, const char *sessionId, const char* bugname, uint64_t generation,
+      NotifyEvent_t event, const char* message, const char* binary, size_t binary_len );
 
     struct lws_per_vhost_data {
       struct lws_context *context;
@@ -40,31 +43,39 @@ namespace drachtio {
       const struct lws_protocols *protocol;
     };
 
-    static void initialize(const char* protocolName, int loglevel, log_emit_function logger);
+    static bool initialize(const char* protocolName, int loglevel, log_emit_function logger);
     static bool deinitialize();
     static bool lws_service_thread();
 
     // constructor
     AudioPipe(const char* uuid, const char* host, unsigned int port, const char* path, int sslFlags, 
       size_t bufLen, size_t minFreespace, const char* username, const char* password, char* bugname,
-      int bidirectional_audio, notifyHandler_t callback);
+      uint64_t generation, int bidirectional_audio, notifyHandler_t callback);
     ~AudioPipe();  
 
     LwsState_t getLwsState(void) { return m_state.load(std::memory_order_acquire); }
-    void connect(void);
+    bool isValid(void) const { return m_valid.load(std::memory_order_acquire); }
+    void addRef(void);
+    void release(void);
+    void releaseOwner(void);
+    void releaseWsiRef(void);
+    void safe_destroy(void);
+    bool connect(void);
     void bufferForSending(const char* text);
     void closeAndDestroy(void);
     size_t binarySpaceAvailable(void) {
-      return m_audio_buffer_max_len - m_audio_buffer_write_offset;
+      return m_audio_buffer && m_audio_buffer_write_offset < m_audio_buffer_max_len
+        ? m_audio_buffer_max_len - m_audio_buffer_write_offset : 0;
     }
     size_t binaryMinSpace(void) {
       return m_audio_buffer_min_freespace;
     }
     char * binaryWritePtr(void) { 
-      return (char *) m_audio_buffer + m_audio_buffer_write_offset;
+      return (m_audio_buffer && m_audio_buffer_write_offset < m_audio_buffer_max_len)
+        ? (char *) m_audio_buffer + m_audio_buffer_write_offset : nullptr;
     }
     void binaryWritePtrAdd(size_t len) {
-      m_audio_buffer_write_offset += len;
+      if (len <= binarySpaceAvailable()) m_audio_buffer_write_offset += len;
     }
     void binaryWritePtrReset(void) {
       m_audio_buffer_write_offset = LWS_PRE;
@@ -114,11 +125,14 @@ namespace drachtio {
     static log_emit_function logger;
 
     static std::mutex mapMutex;
+    static std::mutex instancesMutex;
+    static std::unordered_set<AudioPipe*> instances;
     static std::atomic<bool> stopFlag;
+    static std::atomic<bool> shuttingDown;
 
     static AudioPipe* findAndRemovePendingConnect(struct lws *wsi);
     static AudioPipe* findPendingConnect(struct lws *wsi);
-    static void addPendingConnect(AudioPipe* ap);
+    static bool addPendingConnect(AudioPipe* ap);
     static void addPendingDisconnect(AudioPipe* ap);
     static void addPendingWrite(AudioPipe* ap);
     static void removeFromPendingLists(AudioPipe* ap);
@@ -132,6 +146,7 @@ namespace drachtio {
     std::string m_uuid;
     std::string m_host;
     std::string m_bugname;
+    uint64_t m_generation;
     unsigned int m_port;
     std::string m_path;
     std::list<std::string> m_metadata_list;
@@ -153,6 +168,11 @@ namespace drachtio {
     std::string m_password;
     std::atomic<bool> m_gracefulShutdown;
     std::atomic<bool> m_delete_on_close;
+    std::atomic<bool> m_owner_released;
+    std::atomic<bool> m_valid;
+    std::atomic<bool> m_disconnect_pending;
+    std::atomic<bool> m_wsi_ref;
+    std::atomic<unsigned int> m_refCount;
     std::atomic<bool> m_write_pending;
     bool m_bidirectional_audio_stream;
   };

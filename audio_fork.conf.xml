@@ -1,0 +1,7 @@
+<configuration name="audio_fork.conf" description="mod_audio_fork 播放配置">
+  <settings>
+    <!-- 两条播放路径独立配置起播预缓冲，单位 ms，取值 1-5000。 -->
+    <param name="ws-prebuffer-ms" value="200"/>
+    <param name="http-prebuffer-ms" value="200"/>
+  </settings>
+</configuration>

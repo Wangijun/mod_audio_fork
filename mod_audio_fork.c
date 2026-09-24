@@ -5,6 +5,67 @@
 #include "lws_glue.h"
 #include "audio_fork_http.h"
 #include "audio_fork_ws.h"
+#include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+
+uint32_t audio_fork_ws_prebuffer_ms = 200;
+uint32_t audio_fork_http_prebuffer_ms = 200;
+
+/* 模块加载时读取两条播放路径的起播缓冲；缺少配置时使用内置默认值。 */
+static switch_status_t audio_fork_load_config(void) {
+    switch_xml_t xml, cfg, settings, param;
+    char path[1024];
+    audio_fork_ws_prebuffer_ms = 200;
+    audio_fork_http_prebuffer_ms = 200;
+    switch_snprintf(path, sizeof(path), "%s%sautoload_configs%saudio_fork.conf.xml",
+                    SWITCH_GLOBAL_dirs.conf_dir, SWITCH_PATH_SEPARATOR, SWITCH_PATH_SEPARATOR);
+    if (access(path, F_OK) != 0 && errno == ENOENT) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+                          "mod_audio_fork: 未找到 %s，HTTP 与 WebSocket 预缓冲均使用默认值 200 ms\n", path);
+        return SWITCH_STATUS_SUCCESS;
+    }
+    if (!(xml = switch_xml_open_cfg("audio_fork.conf", &cfg, NULL))) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                          "mod_audio_fork: 无法读取 audio_fork.conf.xml\n");
+        return SWITCH_STATUS_TERM;
+    }
+    const char *value = "";
+    const char *invalid_name = "";
+    if ((settings = switch_xml_child(cfg, "settings"))) {
+        for (param = switch_xml_child(settings, "param"); param; param = param->next) {
+            const char *name = switch_xml_attr_soft(param, "name");
+            value = switch_xml_attr_soft(param, "value");
+            if (!strcmp(name, "ws-prebuffer-ms") || !strcmp(name, "http-prebuffer-ms")) {
+                invalid_name = name;
+                char *end = NULL;
+                unsigned long parsed;
+                if (!*value || *value == '-' || *value == '+') goto invalid;
+                for (const char *p = value; *p; ++p) {
+                    if (*p < '0' || *p > '9') goto invalid;
+                }
+                errno = 0;
+                parsed = strtoul(value, &end, 10);
+                if (errno == ERANGE || *end || parsed < 1 || parsed > 5000) goto invalid;
+                if (!strcmp(name, "ws-prebuffer-ms")) {
+                    audio_fork_ws_prebuffer_ms = (uint32_t)parsed;
+                } else {
+                    audio_fork_http_prebuffer_ms = (uint32_t)parsed;
+                }
+            }
+        }
+    }
+    switch_xml_free(xml);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+                      "mod_audio_fork: HTTP 预缓冲 %u ms，WebSocket 预缓冲 %u ms\n",
+                      audio_fork_http_prebuffer_ms, audio_fork_ws_prebuffer_ms);
+    return SWITCH_STATUS_SUCCESS;
+invalid:
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                      "mod_audio_fork: %s 无效: %s（允许 1-5000）\n", invalid_name, value);
+    switch_xml_free(xml);
+    return SWITCH_STATUS_TERM;
+}
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown);
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_audio_fork_runtime);
@@ -62,6 +123,29 @@ SWITCH_MODULE_DEFINITION(mod_audio_fork, mod_audio_fork_load, mod_audio_fork_shu
 
 static char *audio_fork_supported_formats[] = { (char *)"audio_fork", NULL };
 
+static int parse_ws_sampling_rate(const char *value, int *rate) {
+	char *end = NULL;
+	long parsed;
+	if (!value || !rate || !*value) return 0;
+	if (!strcasecmp(value, "8k")) parsed = 8000;
+	else if (!strcasecmp(value, "16k")) parsed = 16000;
+	else if (!strcasecmp(value, "24k")) parsed = 24000;
+	else if (!strcasecmp(value, "32k")) parsed = 32000;
+	else if (!strcasecmp(value, "40k")) parsed = 40000;
+	else if (!strcasecmp(value, "48k")) parsed = 48000;
+	else if (!strcasecmp(value, "56k")) parsed = 56000;
+	else if (!strcasecmp(value, "64k")) parsed = 64000;
+	else {
+		if (value[0] < '0' || value[0] > '9') return 0;
+		errno = 0;
+		parsed = strtol(value, &end, 10);
+		if (errno == ERANGE || end == value || *end != '\0') return 0;
+	}
+	if (parsed < 8000 || parsed > 64000 || (parsed % 8000) != 0) return 0;
+	*rate = (int)parsed;
+	return 1;
+}
+
 static void responseHandler(switch_core_session_t* session, const char * eventName, char * json) {
 	switch_event_t *event;
 
@@ -87,7 +171,7 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 	case SWITCH_ABC_TYPE_CLOSE:
 		{
 			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "收到 SWITCH_ABC_TYPE_CLOSE，监听器: %s\n", tech_pvt->bugname);
-			fork_session_cleanup(session, tech_pvt->bugname, NULL, 1);
+			fork_session_cleanup(session, bug, NULL, 1);
 		}
 		break;
 
@@ -125,6 +209,12 @@ static switch_status_t start_capture(switch_core_session_t *session,
 		"mod_audio_fork (%s): 以采样率 %d 流传输到 %s 路径 %s 端口 %d TLS: %s.\n",
 		bugname, sampling, host, path, port, sslFlags ? "是" : "否");
 
+	if (channels < 1 || channels > 2 || sampling < 8000 || sampling > 64000 || (sampling % 8000) != 0 ||
+		zstr(bugname) || strlen(bugname) > MAX_BUG_LEN) {
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 非法采样率、声道数或监听器名称\n");
+		return SWITCH_STATUS_FALSE;
+	}
+
 	if (switch_channel_get_private(channel, bugname)) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 监听器 %s 已经挂载!\n", bugname);
 		return SWITCH_STATUS_FALSE;
@@ -156,6 +246,7 @@ static switch_status_t start_capture(switch_core_session_t *session,
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "正在添加 media bug.\n");
 	if ((status = switch_core_media_bug_add(session, bugname, NULL, capture_callback, pUserData, 0, flags, &bug)) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 添加 media bug 失败!\n");
+		fork_data_destroy((private_t *)pUserData);
 		return status;
 	}
 
@@ -164,8 +255,7 @@ static switch_status_t start_capture(switch_core_session_t *session,
 
 	if (fork_session_connect(&pUserData) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork 会话无法连接.\n");
-		switch_channel_set_private(channel, bugname, NULL);
-		switch_core_media_bug_remove(session, &bug);
+		fork_session_cleanup(session, bug, NULL, 0);
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -182,9 +272,7 @@ static switch_status_t do_stop(switch_core_session_t *session, char* bugname, ch
 
 	if (bug) {
 		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_fork (%s): 停止分流.\n", bugname);
-		switch_channel_set_private(channel, bugname, NULL);
-		fork_session_cleanup(session, bugname, text, 0);
-		status = switch_core_media_bug_remove(session, &bug);
+		status = fork_session_cleanup(session, bug, text, 0);
 	}
 	return status;
 }
@@ -225,7 +313,7 @@ static switch_status_t send_text(switch_core_session_t *session, char* bugname, 
 	return status;
 }
 
-#define FORK_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown] [wss-url | path] [mono | mixed | stereo] [8000 | 16000 | 24000 | 32000 | 64000] [bugname] [metadata]"
+#define FORK_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown] [ws/wss/http/https-url | path] [mono | mixed | stereo] [8000..64000 (8000-step)] [bugname] [metadata]"
 SWITCH_STANDARD_API(fork_function)
 {
 	char *mycmd = NULL, *argv[10] = { 0 };
@@ -348,26 +436,18 @@ SWITCH_STANDARD_API(fork_function)
 				else if(0 != strcmp(argv[3], "mono")) {
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "无效的混音类型: %s，必须是 mono、mixed 或 stereo\n", argv[3]);
 					switch_core_session_rwunlock(lsession);
-					goto done;
+					goto report_status;
 				}
-				if (0 == strcmp(argv[4], "16k")) {
-					sampling = 16000;
-				}
-				else if (0 == strcmp(argv[4], "8k")) {
-					sampling = 8000;
-				}
-				else {
-					sampling = atoi(argv[4]);
+				if (!parse_ws_sampling_rate(argv[4], &sampling)) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+						"无效的采样率: %s（要求 8000..64000 且为 8000 的整数倍）\n", argv[4]);
+					switch_core_session_rwunlock(lsession);
+					goto report_status;
 				}
 				if (!parse_ws_uri(channel, argv[2], &host[0], &path[0], &port, &sslFlags)) {
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "无效的 WebSocket URI: %s\n", argv[2]);
 					switch_core_session_rwunlock(lsession);
-					goto done;
-				}
-				else if (sampling % 8000 != 0) {
-					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "无效的采样率: %s\n", argv[4]);
-					switch_core_session_rwunlock(lsession);
-					goto done;
+					goto report_status;
 				}
 				status = start_capture(lsession, flags, host, port, path, sampling, sslFlags, bugname, metadata);
 			}
@@ -386,6 +466,7 @@ SWITCH_STANDARD_API(fork_function)
 		}
 	}
 
+report_status:
 	if (status == SWITCH_STATUS_SUCCESS) {
 		stream->write_function(stream, "+OK 成功\n");
 	} else {
@@ -403,6 +484,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
 	switch_file_interface_t *file_interface;
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork API 正在加载..\n");
+	if (audio_fork_load_config() != SWITCH_STATUS_SUCCESS) return SWITCH_STATUS_TERM;
 
 	/* 将内部结构连接到传入的空白指针 */
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
@@ -413,15 +495,19 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
 		switch_event_reserve_subclass(EVENT_PLAY_AUDIO) != SWITCH_STATUS_SUCCESS ||
 		switch_event_reserve_subclass(EVENT_KILL_AUDIO) != SWITCH_STATUS_SUCCESS ||
 		switch_event_reserve_subclass(EVENT_ERROR) != SWITCH_STATUS_SUCCESS ||
-		switch_event_reserve_subclass(EVENT_DISCONNECT) != SWITCH_STATUS_SUCCESS) {
+		switch_event_reserve_subclass(EVENT_DISCONNECT) != SWITCH_STATUS_SUCCESS ||
+		switch_event_reserve_subclass(EVENT_CONNECT_SUCCESS) != SWITCH_STATUS_SUCCESS ||
+		switch_event_reserve_subclass(EVENT_CONNECT_FAIL) != SWITCH_STATUS_SUCCESS ||
+		switch_event_reserve_subclass(EVENT_BUFFER_OVERRUN) != SWITCH_STATUS_SUCCESS ||
+		switch_event_reserve_subclass(EVENT_JSON) != SWITCH_STATUS_SUCCESS) {
 
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "无法为 mod_audio_fork API 注册事件子类.\n");
 		return SWITCH_STATUS_TERM;
 	}
 
 	SWITCH_ADD_API(api_interface, "uuid_audio_fork", "audio_fork API", fork_function, FORK_API_SYNTAX);
-	switch_console_set_complete("add uuid_audio_fork start wss-url metadata");
-	switch_console_set_complete("add uuid_audio_fork start wss-url");
+	switch_console_set_complete("add uuid_audio_fork start ws-url metadata");
+	switch_console_set_complete("add uuid_audio_fork start ws-url");
 	switch_console_set_complete("add uuid_audio_fork stop");
 
 	/* 注册 SWITCH_FILE_INTERFACE 原生流式文件驱动接口 */
@@ -432,7 +518,20 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
 	file_interface->file_close = audio_fork_file_close;
 	file_interface->file_read = audio_fork_file_read;
 
-	fork_init();
+	if (fork_init() != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_audio_fork: 初始化失败\n");
+		switch_event_free_subclass(EVENT_TRANSCRIPTION);
+		switch_event_free_subclass(EVENT_TRANSFER);
+		switch_event_free_subclass(EVENT_PLAY_AUDIO);
+		switch_event_free_subclass(EVENT_KILL_AUDIO);
+		switch_event_free_subclass(EVENT_DISCONNECT);
+		switch_event_free_subclass(EVENT_ERROR);
+		switch_event_free_subclass(EVENT_CONNECT_SUCCESS);
+		switch_event_free_subclass(EVENT_CONNECT_FAIL);
+		switch_event_free_subclass(EVENT_BUFFER_OVERRUN);
+		switch_event_free_subclass(EVENT_JSON);
+		return SWITCH_STATUS_TERM;
+	}
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork API 加载成功\n");
 
@@ -448,6 +547,10 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown)
 	switch_event_free_subclass(EVENT_KILL_AUDIO);
 	switch_event_free_subclass(EVENT_DISCONNECT);
 	switch_event_free_subclass(EVENT_ERROR);
+	switch_event_free_subclass(EVENT_CONNECT_SUCCESS);
+	switch_event_free_subclass(EVENT_CONNECT_FAIL);
+	switch_event_free_subclass(EVENT_BUFFER_OVERRUN);
+	switch_event_free_subclass(EVENT_JSON);
 
 	return SWITCH_STATUS_SUCCESS;
 }
