@@ -12,7 +12,7 @@ extern "C" {
 #define SILENCE_WATCHDOG_DEFAULT_FRAMES 150  /* 默认连续欠载 150 帧 (3000ms) 触发看门狗强退 */
 #define MAX_AUDIO_FORK_BUFFER_BYTES     1600000 /* 约 50 秒 16kHz 16-bit Mono 缓冲硬上限 (防爆内存且杜绝长播报丢帧) */
 
-/* HTTP 下行同样只接受 URL 指定格式的交错 S16LE 裸 PCM。 */
+/* HTTP 下行同样只接受 URL 指定格式的交错 S16LE 裸 PCM. */
 typedef struct audio_fork_http_ctx {
   audio_fork_driver_type_t    driver_type;        /* 驱动类型标识: 必须位于结构体首地址 */
   switch_memory_pool_t       *pool;              /* 专属内存池 */
@@ -25,15 +25,16 @@ typedef struct audio_fork_http_ctx {
 
   uint32_t                    samplerate;        /* 采样率 (默认 16000) */
   uint32_t                    channels;          /* 声道数 (默认 1) */
-  uint32_t                    prebuffer_bytes;   /* 起播所需预缓冲字节数，由模块配置决定 */
+  uint32_t                    prebuffer_bytes;   /* 起播所需预缓冲字节数, 由模块配置决定 */
 
-  switch_atomic_t             abort_requested;   /* 打断/关闭标记：1=立即终止拉流 */
+  switch_atomic_t             abort_requested;   /* 打断/关闭标记: 1=立即终止拉流 */
   switch_atomic_t             eof;               /* curl 拉流是否正常结束 (EOF) */
   switch_atomic_t             err;               /* 是否发生网络/HTTP 错误 */
   long                        http_response_code;/* HTTP 响应状态码 (如 200) */
 
   uint32_t                    silence_frames;    /* 连续静音欠载帧计数 (看门狗) */
-  uint32_t                    underrun_frames;   /* 播放期间缓冲读空的总帧数 */
+  uint32_t                    underrun_frames;   /* 播放期间缓冲读空的总次数 */
+  uint64_t                    underrun_samples;  /* 播放期间缓冲读空的总采样数 */
   uint32_t                    max_silence_frames;/* 静音看门狗最大帧阈值 */
 } audio_fork_http_ctx_t;
 
