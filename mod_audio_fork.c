@@ -1,5 +1,5 @@
 /*
- * mod_audio_fork.c -- FreeSWITCH 模块，用于通过 WebSocket 将音频分流到远程服务器
+ * mod_audio_fork.c -- FreeSWITCH 模块, 用于通过 WebSocket 将音频分流到远程服务器
  */
 #include "mod_audio_fork.h"
 #include "lws_glue.h"
@@ -12,7 +12,7 @@
 uint32_t audio_fork_ws_prebuffer_ms = 200;
 uint32_t audio_fork_http_prebuffer_ms = 200;
 
-/* 模块加载时读取两条播放路径的起播缓冲；缺少配置时使用内置默认值。 */
+/* 模块加载时读取两条播放路径的起播缓冲; 缺少配置时使用内置默认值. */
 static switch_status_t audio_fork_load_config(void) {
     switch_xml_t xml, cfg, settings, param;
     char path[1024];
@@ -22,7 +22,7 @@ static switch_status_t audio_fork_load_config(void) {
                     SWITCH_GLOBAL_dirs.conf_dir, SWITCH_PATH_SEPARATOR, SWITCH_PATH_SEPARATOR);
     if (access(path, F_OK) != 0 && errno == ENOENT) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
-                          "mod_audio_fork: 未找到 %s，HTTP 与 WebSocket 预缓冲均使用默认值 200 ms\n", path);
+                          "mod_audio_fork: 未找到 %s, HTTP 与 WebSocket 预缓冲均使用默认值 200 ms\n", path);
         return SWITCH_STATUS_SUCCESS;
     }
     if (!(xml = switch_xml_open_cfg("audio_fork.conf", &cfg, NULL))) {
@@ -57,12 +57,12 @@ static switch_status_t audio_fork_load_config(void) {
     }
     switch_xml_free(xml);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
-                      "mod_audio_fork: HTTP 预缓冲 %u ms，WebSocket 预缓冲 %u ms\n",
+                      "mod_audio_fork: HTTP 预缓冲 %u ms, WebSocket 预缓冲 %u ms\n",
                       audio_fork_http_prebuffer_ms, audio_fork_ws_prebuffer_ms);
     return SWITCH_STATUS_SUCCESS;
 invalid:
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-                      "mod_audio_fork: %s 无效: %s（允许 1-5000）\n", invalid_name, value);
+                      "mod_audio_fork: %s 无效: %s(允许 1-5000)\n", invalid_name, value);
     switch_xml_free(xml);
     return SWITCH_STATUS_TERM;
 }
@@ -82,12 +82,12 @@ static switch_status_t audio_fork_file_open(switch_file_handle_t *handle, const 
 		p += 13;
 	}
 
-	/* 模式 A：以 http:// 或 https:// 开头，路由至 HTTP Chunked 异步拉流 */
+	/* 模式 A: 以 http:// 或 https:// 开头, 路由至 HTTP Chunked 异步拉流 */
 	if (!strncasecmp(p, "http://", 7) || !strncasecmp(p, "https://", 8)) {
 		return audio_fork_http_file_open(handle, path);
 	}
 
-	/* 模式 B：以 UUID / Session 寻址，路由至 WebSocket 全双工内存桥 */
+	/* 模式 B: 以 UUID / Session 寻址, 路由至 WebSocket 全双工内存桥 */
 	return audio_fork_ws_file_open(handle, path);
 }
 
@@ -170,7 +170,7 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 
 	case SWITCH_ABC_TYPE_CLOSE:
 		{
-			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "收到 SWITCH_ABC_TYPE_CLOSE，监听器: %s\n", tech_pvt->bugname);
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "收到 SWITCH_ABC_TYPE_CLOSE, 监听器: %s\n", tech_pvt->bugname);
 			fork_session_cleanup(session, bug, NULL, 1);
 		}
 		break;
@@ -211,7 +211,7 @@ static switch_status_t start_capture(switch_core_session_t *session,
 
 	if (channels < 1 || channels > 2 || sampling < 8000 || sampling > 64000 || (sampling % 8000) != 0 ||
 		zstr(bugname) || strlen(bugname) > MAX_BUG_LEN) {
-		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 非法采样率、声道数或监听器名称\n");
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 非法采样率, 声道数或监听器名称\n");
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -221,7 +221,7 @@ static switch_status_t start_capture(switch_core_session_t *session,
 	}
 
 	if (!switch_channel_ready(channel)) {
-		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 通道未就绪，无法启动监听器 %s!\n", bugname);
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 通道未就绪, 无法启动监听器 %s!\n", bugname);
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -232,7 +232,7 @@ static switch_status_t start_capture(switch_core_session_t *session,
 
 	read_codec = switch_core_session_get_read_codec(session);
 	if (!read_codec || !read_codec->implementation) {
-		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 通道没有可用的读取 codec，无法启动监听器 %s!\n", bugname);
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_fork: 通道没有可用的读取 codec, 无法启动监听器 %s!\n", bugname);
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -415,8 +415,8 @@ SWITCH_STANDARD_API(fork_function)
 				switch_media_bug_flag_t flags = SMBF_READ_STREAM;
 				char *metadata = NULL;
 
-				// 7 段式语法：uuid_audio_fork <uuid> start <ws_url> [mix_type] [sampling] [bugname] [metadata]
-				// 针对多于 7 个参数的情况，进行安全兼容忽略
+				// 7 段式语法: uuid_audio_fork <uuid> start <ws_url> [mix_type] [sampling] [bugname] [metadata]
+				// 针对多于 7 个参数的情况, 进行安全兼容忽略
 				if (argc > 6) {
 					if (argv[5][0] != '\0') bugname = argv[5];
 					if (argv[6][0] != '\0') metadata = argv[6];
@@ -434,13 +434,13 @@ SWITCH_STANDARD_API(fork_function)
 					flags |= SMBF_STEREO;
 				}
 				else if(0 != strcmp(argv[3], "mono")) {
-					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "无效的混音类型: %s，必须是 mono、mixed 或 stereo\n", argv[3]);
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "无效的混音类型: %s, 必须是 mono, mixed 或 stereo\n", argv[3]);
 					switch_core_session_rwunlock(lsession);
 					goto report_status;
 				}
 				if (!parse_ws_sampling_rate(argv[4], &sampling)) {
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-						"无效的采样率: %s（要求 8000..64000 且为 8000 的整数倍）\n", argv[4]);
+						"无效的采样率: %s(要求 8000..64000 且为 8000 的整数倍)\n", argv[4]);
 					switch_core_session_rwunlock(lsession);
 					goto report_status;
 				}
@@ -458,7 +458,7 @@ SWITCH_STANDARD_API(fork_function)
 		}
 		else {
 			if (!strcasecmp(argv[1], "stop")) {
-				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "mod_audio_fork: 会话 %s 已结束或不存在，无需重复停止\n", argv[0]);
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "mod_audio_fork: 会话 %s 已结束或不存在, 无需重复停止\n", argv[0]);
 				status = SWITCH_STATUS_SUCCESS;
 			} else {
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "定位会话失败 %s\n", argv[0]);

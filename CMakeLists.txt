@@ -52,7 +52,7 @@ if(NOT FREESWITCH_LIBRARY)
     find_library(FREESWITCH_LIBRARY NAMES freeswitch)
 endif()
 
-# 如果仍未找到 FreeSWITCH，尝试通过 pkg-config 查找
+# 如果仍未找到 FreeSWITCH, 尝试通过 pkg-config 查找
 if(NOT FREESWITCH_INCLUDE_DIR OR NOT FREESWITCH_LIBRARY)
     pkg_check_modules(FREESWITCH_PKG freeswitch)
     if(FREESWITCH_PKG_FOUND)
@@ -64,15 +64,15 @@ endif()
 
 # 检查是否找到 FreeSWITCH
 if(NOT FREESWITCH_INCLUDE_DIR)
-    message(FATAL_ERROR "未找到 FreeSWITCH 头文件。请安装 FreeSWITCH 开发包:
+    message(FATAL_ERROR "未找到 FreeSWITCH 头文件. 请安装 FreeSWITCH 开发包:
     sudo apt-get install freeswitch-dev
-    或手动设置 FREESWITCH_INCLUDE_DIR。")
+    或手动设置 FREESWITCH_INCLUDE_DIR.")
 endif()
 
 if(NOT FREESWITCH_LIBRARY)
-    message(FATAL_ERROR "未找到 FreeSWITCH 库。请安装 FreeSWITCH:
+    message(FATAL_ERROR "未找到 FreeSWITCH 库. 请安装 FreeSWITCH:
     sudo apt-get install freeswitch
-    或手动设置 FREESWITCH_LIBRARY。")
+    或手动设置 FREESWITCH_LIBRARY.")
 endif()
 
 # 查找 libwebsockets
@@ -95,7 +95,7 @@ if(NOT SPEEXDSP_LIBRARY)
     find_library(SPEEXDSP_LIBRARY NAMES speexdsp)
 endif()
 
-# 如果未找到 speexdsp，尝试通过 pkg-config 查找
+# 如果未找到 speexdsp, 尝试通过 pkg-config 查找
 if(NOT SPEEXDSP_LIBRARY)
     pkg_check_modules(SPEEXDSP speexdsp)
     if(SPEEXDSP_FOUND)

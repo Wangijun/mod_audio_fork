@@ -139,15 +139,15 @@ switch_status_t audio_fork_ws_file_open(switch_file_handle_t *handle, const char
   if (query && parse_query_uint(query, "watchdog", WS_MAX_WATCHDOG_MS, &watchdog_ms, &present) < 0) goto invalid_query;
   if (query && query_has_prebuffer(query)) {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
-                      "mod_audio_fork: WebSocket URL 的 prebuffer 参数已被模组忽略，使用 ws-prebuffer-ms=%u ms\n",
+                      "mod_audio_fork: WebSocket URL 的 prebuffer 参数已被模组忽略, 使用 ws-prebuffer-ms=%u ms\n",
                       prebuffer_ms);
   }
-  /* speak_start 已经推进 generation；open 只记录当前代际，不能再次推进，
-     否则合法的 speak_start -> open 顺序会让句柄立即失效。 */
+  /* speak_start 已经推进 generation; open 只记录当前代际, 不能再次推进,
+     否则合法的 speak_start -> open 顺序会让句柄立即失效. */
   generation = tech_pvt->downstream_generation;
   switch_atomic_add(&tech_pvt->downstream_handles, 1);
-  /* 保留 speak_start/binary 在 open 之前到达的 EOF、残余字节和缓冲数据；
-     新句的接收状态由 speak_start 原子地复位。 */
+  /* 保留 speak_start/binary 在 open 之前到达的 EOF, 残余字节和缓冲数据;
+     新句的接收状态由 speak_start 原子地复位. */
   switch_atomic_set(&tech_pvt->downstream_active, 1);
   switch_atomic_set(&tech_pvt->downstream_interrupted, 0);
   switch_atomic_set(&tech_pvt->downstream_accept_audio, 1);
@@ -190,7 +190,7 @@ switch_status_t audio_fork_ws_file_open(switch_file_handle_t *handle, const char
   ctx->channels = channels;
   ctx->prebuffer_bytes = prebuffer_bytes;
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-                    "mod_audio_fork: WebSocket 播放预缓冲配置 %u ms，本次目标 %u 字节\n",
+                    "mod_audio_fork: WebSocket 播放预缓冲配置 %u ms, 本次目标 %u 字节\n",
                     prebuffer_ms, prebuffer_bytes);
   ctx->max_silence_frames = watchdog_ms ? (watchdog_ms / 20U ? watchdog_ms / 20U : 1U) : 0;
   ctx->generation = generation;
@@ -252,7 +252,7 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
       ctx->silence_frames = 0;
       return SWITCH_STATUS_SUCCESS;
     }
-    /* 只有不完整采样帧时先按欠载补静音；等 EOF 再报告协议错误。 */
+    /* 只有不完整采样帧时先按欠载补静音; 等 EOF 再报告协议错误. */
   }
   if (eof) {
     if (tech_pvt->downstream_partial_len ||

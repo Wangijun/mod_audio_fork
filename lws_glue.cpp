@@ -124,10 +124,10 @@ namespace {
       switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
       if (tech_pvt->downstream_partial_len != 0) {
         switch_atomic_set(&tech_pvt->downstream_partial_error, 1);
-        /* 延迟到 file_read 排空完整帧后再报告协议错误。 */
+        /* 延迟到 file_read 排空完整帧后再报告协议错误. */
       }
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-        "(%u) 下行收到零长帧定稿信号，标记 downstream_eof=1\n", tech_pvt->id);
+        "(%u) 下行收到零长帧定稿信号, 标记 downstream_eof=1\n", tech_pvt->id);
     } else if (tech_pvt->downstream_buffer &&
                switch_atomic_read(&tech_pvt->downstream_accept_audio) &&
                !switch_atomic_read(&tech_pvt->downstream_interrupted) &&
@@ -135,7 +135,7 @@ namespace {
       const size_t frame_bytes = (tech_pvt->downstream_channels == 2 ? 4U : 2U);
       size_t offset = 0;
 
-      /* 先补齐上一个 WebSocket fragment 留下的半个采样帧。 */
+      /* 先补齐上一个 WebSocket fragment 留下的半个采样帧. */
       if (tech_pvt->downstream_partial_len != 0) {
         size_t need = frame_bytes - tech_pvt->downstream_partial_len;
         size_t take = (dataLength < need) ? dataLength : need;
@@ -184,7 +184,7 @@ namespace {
 
     if (report_overrun) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-        "(%u) 下行 PCM 缓冲区空间不足，停止接收音频\n", tech_pvt->id);
+        "(%u) 下行 PCM 缓冲区空间不足, 停止接收音频\n", tech_pvt->id);
       switch_atomic_set(&tech_pvt->downstream_eof, 1);
       if (tech_pvt->responseHandler) tech_pvt->responseHandler(session, EVENT_BUFFER_OVERRUN, NULL);
     }
@@ -216,7 +216,7 @@ namespace {
         cJSON* speakId = jsonData ? cJSON_GetObjectItem(jsonData, "speakId") : NULL;
         const char* speakIdValue = cJSON_IsString(speakId) ? speakId->valuestring : "";
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-          "(%u) 收到 killAudio 信令，speakId=%s，设置 interrupted=1 并丢弃后续旧音频\n",
+          "(%u) 收到 killAudio 信令, speakId=%s, 设置 interrupted=1 并丢弃后续旧音频\n",
           tech_pvt->id, speakIdValue);
         char* killPayload = jsonData ? cJSON_PrintUnformatted(jsonData) : NULL;
         tech_pvt->responseHandler(session, EVENT_KILL_AUDIO, killPayload);
@@ -228,18 +228,18 @@ namespace {
           switch_atomic_set(&tech_pvt->downstream_accept_audio, 1);
           switch_atomic_set(&tech_pvt->downstream_eof, 0);
           tech_pvt->downstream_partial_len = 0;
-          /* 每个 speak_start 开启新的语音段；清掉上一段尚未消费的 PCM，
-             避免旧播放句柄的尾音泄漏到新代际。 */
+          /* 每个 speak_start 开启新的语音段; 清掉上一段尚未消费的 PCM,
+             避免旧播放句柄的尾音泄漏到新代际. */
           if (tech_pvt->downstream_buffer) switch_buffer_zero(tech_pvt->downstream_buffer);
           switch_atomic_set(&tech_pvt->downstream_partial_error, 0);
           switch_atomic_set(&tech_pvt->downstream_partial_error_notified, 0);
           switch_atomic_set(&tech_pvt->downstream_overrun_notified, 0);
           tech_pvt->downstream_generation++;
-          /* 旧句柄通过 generation 不匹配退出。全局 interrupted 必须复位，
-             否则旧句柄尚未 close 时到达的新句 PCM 会被误丢弃。 */
+          /* 旧句柄通过 generation 不匹配退出. 全局 interrupted 必须复位,
+             否则旧句柄尚未 close 时到达的新句 PCM 会被误丢弃. */
           switch_atomic_set(&tech_pvt->downstream_interrupted, 0);
           switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-            "(%u) 收到 speak_start 文本信令，开启新代际并接收新句 PCM（旧播放句柄数=%u）\n",
+            "(%u) 收到 speak_start 文本信令, 开启新代际并接收新句 PCM(旧播放句柄数=%u)\n",
             tech_pvt->id, switch_atomic_read(&tech_pvt->downstream_handles));
           switch_mutex_unlock(tech_pvt->downstream_mutex);
         }
@@ -311,7 +311,7 @@ namespace {
     if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
     if (owner) pipe->releaseOwner();
 
-    /* 清理已开始且没有播放句柄时，LWS close 回调是唯一安全的缓冲销毁点。 */
+    /* 清理已开始且没有播放句柄时, LWS close 回调是唯一安全的缓冲销毁点. */
     if (switch_atomic_read(&tech_pvt->cleanup_started) &&
         !switch_atomic_read(&tech_pvt->downstream_active) &&
         switch_atomic_read(&tech_pvt->downstream_handles) == 0 && tech_pvt->downstream_mutex) {
@@ -361,7 +361,7 @@ namespace {
             finishPipe(tech_pvt);
             if (tech_pvt->responseHandler)
               tech_pvt->responseHandler(session, EVENT_CONNECT_FAIL, (char *) jsonStr.str().c_str());
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_NOTICE, "连接失败：%s\n",
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_NOTICE, "连接失败: %s\n",
               pending.message.empty() ? "unknown" : pending.message.c_str());
             break;
           }
@@ -440,8 +440,8 @@ namespace {
     {
       std::lock_guard<std::mutex> lock(event_mutex);
       event_stopping.store(true, std::memory_order_release);
-      /* 模块卸载不再向 FreeSWITCH 投递事件；释放队列中的 pipe 引用，
-         AudioPipe::deinitialize 随后负责 owner/wsi 引用的最终收尾。 */
+      /* 模块卸载不再向 FreeSWITCH 投递事件; 释放队列中的 pipe 引用,
+         AudioPipe::deinitialize 随后负责 owner/wsi 引用的最终收尾. */
       for (pending_event& pending : event_queue) {
         if (pending.pipe) pending.pipe->release();
       }
@@ -454,8 +454,8 @@ namespace {
   static void eventCallback(drachtio::AudioPipe *pipe, const char* sessionId, const char* bugname, uint64_t generation,
     drachtio::AudioPipe::NotifyEvent_t event, const char* message, const char* binary, size_t len) {
     if (!pipe || !sessionId || !bugname) return;
-    /* len 对 MESSAGE/CONNECT_FAIL 表示文本片段或错误文本长度；只有
-       BINARY 事件要求 binary 指针与长度配对。 */
+    /* len 对 MESSAGE/CONNECT_FAIL 表示文本片段或错误文本长度; 只有
+       BINARY 事件要求 binary 指针与长度配对. */
     if (event == drachtio::AudioPipe::BINARY && len > 0 && !binary) return;
     pipe->addRef();
     try {
@@ -479,8 +479,8 @@ namespace {
           return;
         }
         if (event_queue.size() >= MAX_EVENT_QUEUE) {
-          /* PCM 和普通文本是可丢弃的；关闭/失败控制事件必须保留，
-             否则 FreeSWITCH 侧可能永远持有 AudioPipe owner 引用。 */
+          /* PCM 和普通文本是可丢弃的; 关闭/失败控制事件必须保留,
+             否则 FreeSWITCH 侧可能永远持有 AudioPipe owner 引用. */
           auto evict = std::find_if(event_queue.begin(), event_queue.end(),
             [](const pending_event& queued) {
               return queued.event == drachtio::AudioPipe::BINARY ||
@@ -494,14 +494,14 @@ namespace {
             pipe->release();
             return;
           }
-          /* 队列里只剩控制事件时，允许当前控制事件入队，优先保证
-             CONNECT_FAIL / CONNECTION_CLOSED 等终止通知不被静默丢弃。 */
+          /* 队列里只剩控制事件时, 允许当前控制事件入队, 优先保证
+             CONNECT_FAIL / CONNECTION_CLOSED 等终止通知不被静默丢弃. */
         }
         event_queue.emplace_back(std::move(pending));
       }
       event_cv.notify_one();
     } catch (...) {
-      /* 回调位于 LWS 服务线程，不能让分配异常穿透 libwebsockets。 */
+      /* 回调位于 LWS 服务线程, 不能让分配异常穿透 libwebsockets. */
       pipe->release();
     }
   }
@@ -598,7 +598,7 @@ namespace {
       return SWITCH_STATUS_GENERR;
     }
 
-    /* 初始化下行 WebSocket 内存桥环形缓冲区与互斥锁（最大 2 MiB，覆盖 5 秒 64kHz 双声道预缓冲） */
+    /* 初始化下行 WebSocket 内存桥环形缓冲区与互斥锁(最大 2 MiB, 覆盖 5 秒 64kHz 双声道预缓冲) */
     if (switch_mutex_init(&tech_pvt->downstream_mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session)) != SWITCH_STATUS_SUCCESS ||
         switch_buffer_create_dynamic(&tech_pvt->downstream_buffer, 4096, 16384, 2U * 1024U * 1024U) != SWITCH_STATUS_SUCCESS) {
       ap->closeAndDestroy();
@@ -622,7 +622,7 @@ namespace {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%u) 从 %u 重采样到 %u\n", tech_pvt->id, sampling, desiredSampling);
       tech_pvt->resampler = speex_resampler_init(channels, sampling, desiredSampling, SWITCH_RESAMPLE_QUALITY, &err);
       if (0 != err) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "初始化重采样器时出错：%s。\n", speex_resampler_strerror(err));
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "初始化重采样器时出错: %s.\n", speex_resampler_strerror(err));
         destroy_tech_pvt(tech_pvt);
         return SWITCH_STATUS_FALSE;
       }
@@ -699,7 +699,7 @@ extern "C" {
     int lws_ssl_flags = 0;
     if (scheme == "wss" || scheme == "https") lws_ssl_flags = LCCSCF_USE_SSL;
     else if (scheme != "ws" && scheme != "http") {
-      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "无效的协议：%s，必须是 ws/wss 或 http/https\n", scheme.c_str());
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "无效的协议: %s, 必须是 ws/wss 或 http/https\n", scheme.c_str());
       return 0;
     }
 
@@ -798,8 +798,8 @@ extern "C" {
   }
 
   switch_status_t fork_init(void) {
-    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: 音频缓冲（秒）：    %d 秒\n", nAudioBufferSecs);
-    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: 子协议：              %s\n", mySubProtocolName);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: 音频缓冲(秒):    %d 秒\n", nAudioBufferSecs);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: 子协议:              %s\n", mySubProtocolName);
 
     int logs = LLL_ERR | LLL_WARN | LLL_NOTICE;
     if (!startEventWorker()) {
@@ -817,8 +817,8 @@ extern "C" {
   switch_status_t fork_cleanup(void) {
     bool cleanup = false;
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork 正在卸载..\n");
-    /* 模块卸载时先停止业务事件线程，避免 LWS 收尾回调在模块代码卸载
-       期间重新进入 FreeSWITCH；deinitialize 随后释放所有 pipe 引用。 */
+    /* 模块卸载时先停止业务事件线程, 避免 LWS 收尾回调在模块代码卸载
+       期间重新进入 FreeSWITCH; deinitialize 随后释放所有 pipe 引用. */
     stopEventWorker();
     cleanup = drachtio::AudioPipe::deinitialize();
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork 卸载状态 %d\n", cleanup);
@@ -866,10 +866,10 @@ extern "C" {
     }
     private_t* tech_pvt = (private_t *) switch_core_session_alloc(session, sizeof(private_t));
     if (!tech_pvt) {
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "分配内存出错！\n");
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "分配内存出错!\n");
       return SWITCH_STATUS_FALSE;
     }
-    /* fork_data_init 可能在读取 codec 前失败，先清零以保证失败收尾安全。 */
+    /* fork_data_init 可能在读取 codec 前失败, 先清零以保证失败收尾安全. */
     memset(tech_pvt, 0, sizeof(*tech_pvt));
 
     if (SWITCH_STATUS_SUCCESS != fork_data_init(tech_pvt, session, host, port, path, sslFlags, samples_per_second, sampling, channels,
@@ -928,7 +928,7 @@ extern "C" {
     }
     destroy_tech_pvt(tech_pvt);
     switch_atomic_set(&tech_pvt->lifecycle_state, AUDIO_FORK_LIFECYCLE_CLOSED);
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup：连接已关闭\n", id);
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup: 连接已关闭\n", id);
     return SWITCH_STATUS_SUCCESS;
   }
 
@@ -936,7 +936,7 @@ extern "C" {
     switch_channel_t *channel = switch_core_session_get_channel(session);
     switch_media_bug_t *bug = (switch_media_bug_t*) switch_channel_get_private(channel, bugname);
     if (!bug) {
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "fork_session_send_text 失败，因为没有bug\n");
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "fork_session_send_text 失败, 因为没有bug\n");
       return SWITCH_STATUS_FALSE;
     }
     private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
@@ -954,7 +954,7 @@ extern "C" {
     switch_channel_t *channel = switch_core_session_get_channel(session);
     switch_media_bug_t *bug = (switch_media_bug_t*) switch_channel_get_private(channel, bugname);
     if (!bug) {
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "fork_session_pauseresume 失败，因为没有bug\n");
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "fork_session_pauseresume 失败, 因为没有bug\n");
       return SWITCH_STATUS_FALSE;
     }
     private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
@@ -970,7 +970,7 @@ extern "C" {
     switch_channel_t *channel = switch_core_session_get_channel(session);
     switch_media_bug_t *bug = (switch_media_bug_t*) switch_channel_get_private(channel, bugname);
     if (!bug) {
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "fork_session_graceful_shutdown 失败，因为没有bug\n");
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "fork_session_graceful_shutdown 失败, 因为没有bug\n");
       return SWITCH_STATUS_FALSE;
     }
     private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
@@ -1034,7 +1034,7 @@ extern "C" {
               if (!switch_atomic_read(&tech_pvt->buffer_overrun_notified)) {
                 switch_atomic_set(&tech_pvt->buffer_overrun_notified, 1);
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                  "(%u) 上行 AudioPipe 缓冲区空间不足，丢弃音频\n", tech_pvt->id);
+                  "(%u) 上行 AudioPipe 缓冲区空间不足, 丢弃音频\n", tech_pvt->id);
                 tech_pvt->responseHandler(session, EVENT_BUFFER_OVERRUN, NULL);
               }
               break;
@@ -1058,7 +1058,7 @@ extern "C" {
             if (out_len == 0) {
               if (!switch_atomic_read(&tech_pvt->buffer_overrun_notified)) {
                 switch_atomic_set(&tech_pvt->buffer_overrun_notified, 1);
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) 正在丢弃数据包！\n",
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) 正在丢弃数据包!\n",
                   tech_pvt->id);
                 tech_pvt->responseHandler(session, EVENT_BUFFER_OVERRUN, NULL);
               }
@@ -1079,7 +1079,7 @@ extern "C" {
             if (available < pAudioPipe->binaryMinSpace()) {
               if (!switch_atomic_read(&tech_pvt->buffer_overrun_notified)) {
                 switch_atomic_set(&tech_pvt->buffer_overrun_notified, 1);
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) 正在丢弃数据包！\n",
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) 正在丢弃数据包!\n",
                   tech_pvt->id);
                 tech_pvt->responseHandler(session, EVENT_BUFFER_OVERRUN, NULL);
               }

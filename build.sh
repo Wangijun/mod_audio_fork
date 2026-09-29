@@ -5,7 +5,7 @@ set -e
 # build.sh - 构建并安装 mod_audio_fork for FreeSWITCH
 # ============================================================
 
-# 解析脚本目录（在任何 cd 之前执行一次）
+# 解析脚本目录(在任何 cd 之前执行一次)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 自动推导 FreeSWITCH 默认安装路径
@@ -19,7 +19,7 @@ else
     DEFAULT_FS_MOD="/usr/local/freeswitch/mod"
 fi
 
-# 配置（可通过环境变量覆盖）
+# 配置(可通过环境变量覆盖)
 FREESWITCH_INCLUDE_DIR="${FREESWITCH_INCLUDE_DIR:-$DEFAULT_FS_INC}"
 FREESWITCH_LIBRARY="${FREESWITCH_LIBRARY:-$DEFAULT_FS_LIB}"
 FREESWITCH_MOD_DIR="${FREESWITCH_MOD_DIR:-$DEFAULT_FS_MOD}"
@@ -41,7 +41,7 @@ install_dependencies() {
     log_info "正在安装构建依赖..."
     apt-get update -qq
     apt-get install -y -qq cmake libwebsockets-dev git build-essential 2>&1 | tail -5
-    log_info "依赖安装完成。"
+    log_info "依赖安装完成."
 }
 
 # ---- 构建 ----
@@ -91,7 +91,7 @@ install_module() {
             if [ -n "${found}" ]; then
                 so_file="${found}"
             else
-                log_error "未找到 mod_audio_fork.so，请先运行构建。"
+                log_error "未找到 mod_audio_fork.so, 请先运行构建."
                 exit 1
             fi
         fi
@@ -100,7 +100,7 @@ install_module() {
     log_info "正在安装 ${so_file} 到 ${FREESWITCH_MOD_DIR}..."
     mkdir -p "${FREESWITCH_MOD_DIR}"
     cp "${so_file}" "${FREESWITCH_MOD_DIR}/"
-    log_info "模块安装成功。"
+    log_info "模块安装成功."
 }
 
 # ---- 主逻辑 ----
@@ -108,10 +108,10 @@ usage() {
     echo "用法: $0 [deps|build|install|all]"
     echo ""
     echo "命令:"
-    echo "  deps      安装构建依赖（需要 root 权限）"
+    echo "  deps      安装构建依赖(需要 root 权限)"
     echo "  build     配置并构建 mod_audio_fork"
     echo "  install   将 mod_audio_fork.so 复制到 FreeSWITCH 模块目录"
-    echo "  all       执行 deps + build + install（默认）"
+    echo "  all       执行 deps + build + install(默认)"
     echo ""
     echo "环境变量:"
     echo "  FREESWITCH_INCLUDE_DIR  (默认: $DEFAULT_FS_INC)"
