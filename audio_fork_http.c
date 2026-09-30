@@ -1,3 +1,22 @@
+/**
+ * @file audio_fork_http.c
+ * @brief HTTP/HTTPS Chunked 异步拉流下行虚拟文件驱动实现
+ *
+ * 核心机制:
+ * 1. 异步多线程拉流:
+ *    - audio_fork_http_thread 在后台使用 switch_curl (libcurl) 执行 HTTP GET 请求;
+ *    - audio_fork_http_write_cb 回调在收到 chunked 裸 PCM 时写入 audio_buffer 环形缓冲;
+ * 2. 线程同步与背压门控:
+ *    - 缓冲区满时, 写入线程在 audio_cond 上等待最多 250ms (AUDIO_FORK_WRITE_WAIT_US);
+ *    - 读取线程在缓冲空时调用 switch_thread_cond_timedwait 等待最多 200ms 新数据;
+ * 3. 即时打断 (Barge-In / Hangup):
+ *    - 记录底层 socket fd (curlfd), 在需要退出时调用 shutdown(curlfd, SHUT_RDWR)
+ *      强行打断阻塞在内核套接字读取上的 libcurl, 确保即刻退出并安全 join 线程;
+ * 4. 预缓冲与欠载处理:
+ *    - 起播检测循环最多等待 3 秒 (sanity = 600 * 5ms), 达到目标预缓冲字节或 500ms 降级门限后开闸;
+ *    - 播放中若缓冲读空, 连续欠载补静音帧, 并在超过看门狗上限时中止.
+ */
+
 #include "audio_fork_http.h"
 #include <sys/socket.h>
 #include <errno.h>
@@ -5,9 +24,14 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/* 最大看门狗超时时间 (毫秒) */
 #define AUDIO_FORK_MAX_WATCHDOG_MS 600000U
-#define AUDIO_FORK_WRITE_WAIT_US 250000U
+/* HTTP 写入环形缓冲区时的最大背压等待超时 (微秒 = 250ms) */
+#define AUDIO_FORK_WRITE_WAIT_US   250000U
 
+/**
+ * @brief 解析 URL 查询参数中的无符号整型数值
+ */
 static int parse_query_uint(const char *query, const char *name, uint32_t max,
                             uint32_t *value, int *present) {
   size_t name_len = strlen(name);
@@ -40,6 +64,9 @@ static int parse_query_uint(const char *query, const char *name, uint32_t max,
   return 0;
 }
 
+/**
+ * @brief 检查查询字符串中是否包含已被废弃的 prebuffer 参数
+ */
 static int query_has_prebuffer(const char *query) {
   const char *cursor = query;
   while (cursor && *cursor) {
@@ -52,6 +79,10 @@ static int query_has_prebuffer(const char *query) {
   return 0;
 }
 
+/**
+ * @brief 计算起播预缓冲所需的字节数
+ * 公式: rate * channels * 2 * milliseconds / 1000
+ */
 static int calculate_prebuffer_bytes(uint32_t rate, uint32_t channels,
                                      uint32_t milliseconds, uint32_t *result) {
   uint64_t bytes;
@@ -63,16 +94,53 @@ static int calculate_prebuffer_bytes(uint32_t rate, uint32_t channels,
   return 1;
 }
 
+/**
+ * @brief 设置 HTTP 错误与中止标记
+ */
 static void set_http_error(audio_fork_http_ctx_t *ctx) {
   if (!ctx) return;
   switch_atomic_set(&ctx->err, 1);
   switch_atomic_set(&ctx->abort_requested, 1);
 }
 
+/**
+ * @brief 检查拉流是否已请求中止
+ */
 static int http_is_aborted(audio_fork_http_ctx_t *ctx) {
   return !ctx || switch_atomic_read(&ctx->abort_requested) != 0;
 }
 
+/**
+ * @brief 停止后台拉流线程并清理所有内部动态资源 (套接字/条件变量/环形缓冲)
+ */
+static void audio_fork_http_cleanup_resources(audio_fork_http_ctx_t *ctx) {
+  if (!ctx) return;
+  switch_atomic_set(&ctx->abort_requested, 1);
+  if (ctx->audio_mutex) {
+    switch_mutex_lock(ctx->audio_mutex);
+    if (ctx->curlfd > -1) {
+      shutdown(ctx->curlfd, SHUT_RDWR);
+      ctx->curlfd = -1;
+    }
+    if (ctx->audio_cond) switch_thread_cond_broadcast(ctx->audio_cond);
+    switch_mutex_unlock(ctx->audio_mutex);
+  }
+  if (ctx->read_thread) {
+    switch_status_t st;
+    switch_thread_join(&st, ctx->read_thread);
+    ctx->read_thread = NULL;
+  }
+  if (ctx->audio_mutex) {
+    switch_mutex_lock(ctx->audio_mutex);
+    if (ctx->audio_buffer) switch_buffer_destroy(&ctx->audio_buffer);
+    if (ctx->audio_cond) switch_thread_cond_broadcast(ctx->audio_cond);
+    switch_mutex_unlock(ctx->audio_mutex);
+  }
+}
+
+/**
+ * @brief libcurl 套接字创建回调: 记录底层 socket fd 以支持即时 shutdown 解阻塞
+ */
 static int audio_fork_http_sockopt_cb(void *clientp, curl_socket_t curlfd, curlsocktype purpose) {
   audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)clientp;
   (void)purpose;
@@ -92,9 +160,13 @@ static int audio_fork_http_progress_cb(void *clientp, double dltotal, double dln
 {
   audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)clientp;
   (void)dltotal; (void)dlnow; (void)ultotal; (void)ulnow;
+  /* 进度回调返回非 0 即可立即中止 curl 传输 */
   return http_is_aborted(ctx) ? 1 : 0;
 }
 
+/**
+ * @brief libcurl 接收数据写入回调: 将接收到的裸 PCM chunk 写入环形缓冲区
+ */
 static size_t audio_fork_http_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
   audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)userdata;
   if (!ctx || !ptr || size == 0 || nmemb > SIZE_MAX / size || http_is_aborted(ctx)) return 0;
@@ -105,6 +177,7 @@ static size_t audio_fork_http_write_cb(char *ptr, size_t size, size_t nmemb, voi
   }
 
   switch_interval_time_t waited = 0;
+  /* 缓冲区满时进行背压等待 (最多等待 250ms) */
   while (waited < AUDIO_FORK_WRITE_WAIT_US) {
     switch_mutex_lock(ctx->audio_mutex);
     if (http_is_aborted(ctx) || !ctx->audio_buffer) {
@@ -116,6 +189,7 @@ static size_t audio_fork_http_write_cb(char *ptr, size_t size, size_t nmemb, voi
       size_t before = inuse;
       switch_buffer_write(ctx->audio_buffer, ptr, total_bytes);
       size_t after = switch_buffer_inuse(ctx->audio_buffer);
+      /* 唤醒下游消费读线程 */
       if (ctx->audio_cond) switch_thread_cond_signal(ctx->audio_cond);
       switch_mutex_unlock(ctx->audio_mutex);
       if (after >= before && after - before == total_bytes) return total_bytes;
@@ -125,6 +199,7 @@ static size_t audio_fork_http_write_cb(char *ptr, size_t size, size_t nmemb, voi
       set_http_error(ctx);
       return 0;
     }
+    /* 等待消费者释放缓冲空间 */
     if (ctx->audio_cond) switch_thread_cond_timedwait(ctx->audio_cond, ctx->audio_mutex, 5000);
     switch_mutex_unlock(ctx->audio_mutex);
     waited += 5000;
@@ -135,6 +210,9 @@ static size_t audio_fork_http_write_cb(char *ptr, size_t size, size_t nmemb, voi
   return 0;
 }
 
+/**
+ * @brief 后台 curl 异步拉流工作线程函数
+ */
 static void *SWITCH_THREAD_FUNC audio_fork_http_thread(switch_thread_t *thread, void *obj) {
   audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)obj;
   switch_CURL *curl = NULL;
@@ -211,43 +289,40 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
   const char *p = path;
   if (!strncasecmp(p, "audio_fork://", 13)) p += 13;
   char *stream_url = NULL;
-  if (!strncasecmp(p, "http://", 7) || !strncasecmp(p, "https://", 8)) stream_url = switch_core_strdup(handle->memory_pool, p);
-  else stream_url = switch_core_sprintf(handle->memory_pool, "http://%s", p);
+  if (!strncasecmp(p, "http://", 7) || !strncasecmp(p, "https://", 8)) {
+    stream_url = switch_core_strdup(handle->memory_pool, p);
+  } else {
+    stream_url = switch_core_sprintf(handle->memory_pool, "http://%s", p);
+  }
   if (!stream_url) return SWITCH_STATUS_MEMERR;
 
   uint32_t samplerate = 16000, channels = 1, watchdog_ms = 3000;
   uint32_t prebuffer_ms = audio_fork_http_prebuffer_ms;
   char *query = strchr(stream_url, '?');
-  int present = 0, sampling_present = 0;
+  int present = 0;
+  int sampling_present = 0;
   uint32_t sampling_value = 0;
-  if (query && parse_query_uint(query + 1, "rate", 48000, &samplerate, &present) < 0) return SWITCH_STATUS_FALSE;
-  if (query && parse_query_uint(query + 1, "sampling", 48000, &sampling_value, &sampling_present) < 0) return SWITCH_STATUS_FALSE;
-  if (sampling_present && present && sampling_value != samplerate) return SWITCH_STATUS_FALSE;
-  if (sampling_present && !present) samplerate = sampling_value;
-  if (samplerate < 8000 || samplerate > 48000) return SWITCH_STATUS_FALSE;
-  present = 0;
-  if (query && parse_query_uint(query + 1, "channels", 2, &channels, &present) < 0) return SWITCH_STATUS_FALSE;
-  if (channels != 1 && channels != 2) return SWITCH_STATUS_FALSE;
-  present = 0;
-  if (query && parse_query_uint(query + 1, "watchdog", AUDIO_FORK_MAX_WATCHDOG_MS, &watchdog_ms, &present) < 0) return SWITCH_STATUS_FALSE;
-  if (query && query_has_prebuffer(query + 1)) {
-    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
-                      "mod_audio_fork: HTTP URL 的 prebuffer 参数已被模组忽略, 使用 http-prebuffer-ms=%u ms\n",
-                      prebuffer_ms);
-  }
-  uint32_t channel_rate = handle->samplerate ? handle->samplerate : 8000;
-  uint32_t prebuffer_bytes;
-  if (!calculate_prebuffer_bytes(samplerate, channels, prebuffer_ms, &prebuffer_bytes)) return SWITCH_STATUS_FALSE;
 
-  /* 若下游通道采样率低于源流采样率(例如 16k -> 8k 降采样), FreeSWITCH 的 play_say 初始大块读取
-   * (FILE_STARTSAMPLES/2 = 16384 点) 经过降采样需要消耗双倍的源音频(32768 点 = 65536 字节).
-   * 为杜绝起播瞬间即被掏空, 在重采样场景下自适应确保起播缓冲下限不低于重采样步长. */
-  if (channel_rate < samplerate && channel_rate > 0) {
-    uint32_t resample_min_bytes = (uint32_t)((uint64_t)16384 * sizeof(int16_t) * channels * samplerate / channel_rate);
-    if (prebuffer_bytes < resample_min_bytes) {
-      prebuffer_bytes = resample_min_bytes;
+  if (query) {
+    if (parse_query_uint(query + 1, "rate", 48000, &samplerate, &present) < 0) return SWITCH_STATUS_FALSE;
+    if (parse_query_uint(query + 1, "sampling", 48000, &sampling_value, &sampling_present) < 0) return SWITCH_STATUS_FALSE;
+    if (sampling_present && present && sampling_value != samplerate) return SWITCH_STATUS_FALSE;
+    if (sampling_present && !present) { samplerate = sampling_value; present = 1; }
+    if (present && (samplerate < 8000 || samplerate > 48000 || samplerate % 8000 != 0)) return SWITCH_STATUS_FALSE;
+    present = 0;
+    if (parse_query_uint(query + 1, "channels", 2, &channels, &present) < 0) return SWITCH_STATUS_FALSE;
+    if (present && (channels != 1 && channels != 2)) return SWITCH_STATUS_FALSE;
+    present = 0;
+    if (parse_query_uint(query + 1, "watchdog", AUDIO_FORK_MAX_WATCHDOG_MS, &watchdog_ms, &present) < 0) return SWITCH_STATUS_FALSE;
+    if (query_has_prebuffer(query + 1)) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+                        "mod_audio_fork: HTTP URL 的 prebuffer 参数已被模组忽略, 使用 http-prebuffer-ms=%u ms\n",
+                        prebuffer_ms);
     }
   }
+
+  uint32_t prebuffer_bytes;
+  if (!calculate_prebuffer_bytes(samplerate, channels, prebuffer_ms, &prebuffer_bytes)) return SWITCH_STATUS_FALSE;
 
   audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)switch_core_alloc(handle->memory_pool, sizeof(*ctx));
   if (!ctx) return SWITCH_STATUS_MEMERR;
@@ -263,34 +338,23 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
   switch_atomic_set(&ctx->abort_requested, 0);
   switch_atomic_set(&ctx->eof, 0);
   switch_atomic_set(&ctx->err, 0);
+
   if (switch_mutex_init(&ctx->audio_mutex, SWITCH_MUTEX_NESTED, ctx->pool) != SWITCH_STATUS_SUCCESS ||
       switch_thread_cond_create(&ctx->audio_cond, ctx->pool) != SWITCH_STATUS_SUCCESS ||
-      switch_buffer_create_dynamic(&ctx->audio_buffer, 4096, 16384, MAX_AUDIO_FORK_BUFFER_BYTES) != SWITCH_STATUS_SUCCESS) return SWITCH_STATUS_MEMERR;
+      switch_buffer_create_dynamic(&ctx->audio_buffer, 4096, 16384, MAX_AUDIO_FORK_BUFFER_BYTES) != SWITCH_STATUS_SUCCESS) {
+    return SWITCH_STATUS_MEMERR;
+  }
 
   switch_threadattr_t *thd_attr = NULL;
   if (switch_threadattr_create(&thd_attr, ctx->pool) != SWITCH_STATUS_SUCCESS ||
       switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE) != SWITCH_STATUS_SUCCESS ||
       switch_thread_create(&ctx->read_thread, thd_attr, audio_fork_http_thread, ctx, ctx->pool) != SWITCH_STATUS_SUCCESS) {
     set_http_error(ctx);
-    switch_mutex_lock(ctx->audio_mutex);
-    if (ctx->curlfd > -1) {
-      shutdown(ctx->curlfd, SHUT_RDWR);
-      ctx->curlfd = -1;
-    }
-    if (ctx->audio_cond) switch_thread_cond_broadcast(ctx->audio_cond);
-    switch_mutex_unlock(ctx->audio_mutex);
-    /* 即使创建接口返回失败, 也统一等待可能已经启动的线程, 避免它访问已销毁缓冲. */
-    if (ctx->read_thread) {
-      switch_status_t st;
-      switch_thread_join(&st, ctx->read_thread);
-      ctx->read_thread = NULL;
-    }
-    switch_mutex_lock(ctx->audio_mutex);
-    if (ctx->audio_buffer) switch_buffer_destroy(&ctx->audio_buffer);
-    switch_mutex_unlock(ctx->audio_mutex);
+    audio_fork_http_cleanup_resources(ctx);
     return SWITCH_STATUS_GENERR;
   }
 
+  /* 起播预缓冲检测循环: 每 5ms 轮询一次, 最多等待 3000ms (600 次迭代) */
   int sanity = 600;
   uint32_t degradation_bytes = (uint32_t)(((uint64_t)samplerate * channels * sizeof(int16_t) * 500U) / 1000U);
   while (--sanity > 0 && !switch_atomic_read(&ctx->abort_requested) && !switch_atomic_read(&ctx->err)) {
@@ -299,30 +363,29 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
     int eof = (int)switch_atomic_read(&ctx->eof);
     switch_mutex_unlock(ctx->audio_mutex);
     if (eof) break;
+    /* 达到预缓冲门限或超过 1 秒 (sanity <= 400) 达到 500ms 降级门限时开闸 */
     if (inuse >= ctx->prebuffer_bytes || (sanity <= 400 && inuse >= degradation_bytes)) break;
     switch_yield(5000);
   }
+
   switch_mutex_lock(ctx->audio_mutex);
   size_t initial_inuse = ctx->audio_buffer ? switch_buffer_inuse(ctx->audio_buffer) : 0;
   if (ctx->audio_cond) switch_thread_cond_signal(ctx->audio_cond);
   switch_mutex_unlock(ctx->audio_mutex);
+
   if ((switch_atomic_read(&ctx->err) && initial_inuse == 0) ||
       (switch_atomic_read(&ctx->eof) && initial_inuse == 0) ||
       (sanity <= 0 && initial_inuse == 0)) {
-    switch_atomic_set(&ctx->abort_requested, 1);
-    switch_mutex_lock(ctx->audio_mutex);
-    if (ctx->curlfd > -1) { shutdown(ctx->curlfd, SHUT_RDWR); ctx->curlfd = -1; }
-    switch_mutex_unlock(ctx->audio_mutex);
-    if (ctx->read_thread) { switch_status_t st; switch_thread_join(&st, ctx->read_thread); ctx->read_thread = NULL; }
-    switch_mutex_lock(ctx->audio_mutex);
-    if (ctx->audio_buffer) switch_buffer_destroy(&ctx->audio_buffer);
-    switch_mutex_unlock(ctx->audio_mutex);
+    set_http_error(ctx);
+    audio_fork_http_cleanup_resources(ctx);
     return SWITCH_STATUS_GENERR;
   }
+
   switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
                     "mod_audio_fork: HTTP 播放预缓冲配置 %u ms, 本次起播缓冲 %zu 字节(目标 %u 字节)%s\n",
                     prebuffer_ms, initial_inuse, ctx->prebuffer_bytes,
                     initial_inuse < ctx->prebuffer_bytes ? ", 慢流降级或流结束" : "");
+
   handle->private_info = ctx;
   handle->samplerate = samplerate;
   handle->channels = (uint8_t)channels;
@@ -348,7 +411,7 @@ switch_status_t audio_fork_http_file_read(switch_file_handle_t *handle, void *da
   int err = (int)switch_atomic_read(&ctx->err);
   int abort = (int)switch_atomic_read(&ctx->abort_requested);
 
-  /* 若缓冲区为空, 但流尚未结束且未出错, 未被打断, 最多等待一小段时间(如 200ms)等待新数据写入 */
+  /* 若缓冲区为空, 但流尚未结束且未出错、未被打断, 最多阻塞 200ms 等待新数据写入 */
   while (inuse == 0 && !eof && !err && !abort) {
     if (switch_thread_cond_timedwait(ctx->audio_cond, ctx->audio_mutex, 200000) != SWITCH_STATUS_SUCCESS) {
       break;
@@ -359,6 +422,7 @@ switch_status_t audio_fork_http_file_read(switch_file_handle_t *handle, void *da
     abort = (int)switch_atomic_read(&ctx->abort_requested);
   }
 
+  /* 1. 正常读取对齐的 PCM 数据 */
   if (inuse > 0 && ctx->audio_buffer) {
     size_t safe_inuse = inuse - (inuse % frame_bytes);
     size_t to_read = bytes_needed < safe_inuse ? bytes_needed : safe_inuse;
@@ -383,7 +447,7 @@ switch_status_t audio_fork_http_file_read(switch_file_handle_t *handle, void *da
     return SWITCH_STATUS_FALSE;
   }
 
-  /* 缓冲区读空欠载处理 */
+  /* 2. 欠载补偿: 缓冲临时读空, 填充静音并统计 */
   memset(data, 0, bytes_needed);
   *len = bytes_needed / frame_bytes;
   ctx->silence_frames++;
@@ -403,21 +467,16 @@ switch_status_t audio_fork_http_file_close(switch_file_handle_t *handle) {
   if (!handle || !handle->private_info) return SWITCH_STATUS_SUCCESS;
   audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)handle->private_info;
   handle->private_info = NULL;
-  switch_atomic_set(&ctx->abort_requested, 1);
-  switch_mutex_lock(ctx->audio_mutex);
-  if (ctx->curlfd > -1) { shutdown(ctx->curlfd, SHUT_RDWR); ctx->curlfd = -1; }
-  if (ctx->audio_cond) switch_thread_cond_broadcast(ctx->audio_cond);
-  switch_mutex_unlock(ctx->audio_mutex);
-  if (ctx->read_thread) { switch_status_t st; switch_thread_join(&st, ctx->read_thread); ctx->read_thread = NULL; }
+
+  /* 输出播放期间的欠载统计日志 (便于排查弱网或 TTS 推流抖动) */
   if (ctx->underrun_frames) {
     uint32_t underrun_ms = ctx->samplerate ? (uint32_t)(ctx->underrun_samples * 1000ULL / ctx->samplerate) : (ctx->underrun_frames * 20U);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
                       "mod_audio_fork: HTTP 播放期间缓冲读空 %u 次(共 %u ms), URL=%s\n",
                       ctx->underrun_frames, underrun_ms, ctx->stream_url);
   }
-  switch_mutex_lock(ctx->audio_mutex);
-  if (ctx->audio_buffer) switch_buffer_destroy(&ctx->audio_buffer);
-  if (ctx->audio_cond) switch_thread_cond_broadcast(ctx->audio_cond);
-  switch_mutex_unlock(ctx->audio_mutex);
+
+  /* 安全释放拉流线程与音频缓冲资源 */
+  audio_fork_http_cleanup_resources(ctx);
   return SWITCH_STATUS_SUCCESS;
 }

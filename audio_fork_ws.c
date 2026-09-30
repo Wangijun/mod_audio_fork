@@ -1,12 +1,38 @@
+/**
+ * @file audio_fork_ws.c
+ * @brief WebSocket 全双工下行内存桥虚拟文件驱动实现
+ *
+ * 核心设计:
+ * 1. 内存桥接模型:
+ *    - 读端 (FreeSWITCH 核心播放引擎): 调用 audio_fork_ws_file_read(), 从 downstream_buffer 读取 S16LE PCM;
+ *    - 写端 (LWS 事件分发线程): 收到下行 BINARY 帧, 由 processIncomingBinary() 将 PCM 追加写入 downstream_buffer;
+ * 2. 状态机与保护机制:
+ *    - downstream_active: 标记当前是否有活跃的下行播放句柄;
+ *    - downstream_generation: 代际计数器, speak_start 推进代际, 句柄如果 generation 不匹配则判定为旧播报并优雅退出;
+ *    - downstream_partial: 字节对齐缓冲区, 处理跨 WebSocket 碎片边界的奇数字节 (不足 1 个完整 16-bit 采样);
+ *    - downstream_interrupted: 即时打断标记, 收到 killAudio 信令后置 1 并清空环形缓冲.
+ */
+
 #include "audio_fork_ws.h"
 
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
 
+/* 默认连续欠载 150 帧 (3000ms) 触发看门狗强退 */
 #define WS_SILENCE_WATCHDOG_DEFAULT_FRAMES 150
+/* 看门狗最大超时保护限制 (10 分钟) */
 #define WS_MAX_WATCHDOG_MS                 600000
 
+/**
+ * @brief 解析 URL 查询字符串中的无符号整型参数
+ * @param query 查询字符串 (形如 "rate=16000&channels=1")
+ * @param name 目标参数名
+ * @param max 参数允许的最大上限
+ * @param[out] value 解析出的数值存储地址
+ * @param[out] present 是否存在该参数的布尔标记
+ * @return 1=成功解析并赋值, 0=未找到该参数, -1=参数格式非法或超出范围
+ */
 static int parse_query_uint(const char *query, const char *name, uint32_t max,
                             uint32_t *value, int *present) {
   const size_t name_len = strlen(name);
@@ -40,6 +66,9 @@ static int parse_query_uint(const char *query, const char *name, uint32_t max,
   return 0;
 }
 
+/**
+ * @brief 检查查询字符串中是否包含已被废弃的 prebuffer 参数
+ */
 static int query_has_prebuffer(const char *query) {
   const char *cursor = query;
   while (cursor && *cursor) {
@@ -52,6 +81,10 @@ static int query_has_prebuffer(const char *query) {
   return 0;
 }
 
+/**
+ * @brief 根据采样率、声道数与毫秒数精确计算起播预缓冲所需的字节数
+ * 公式: bytes = rate * channels * 2(bytes/sample) * ms / 1000
+ */
 static int calculate_prebuffer_bytes(uint32_t rate, uint32_t channels,
                                      uint32_t milliseconds, uint32_t *result) {
   uint64_t bytes;
@@ -63,8 +96,25 @@ static int calculate_prebuffer_bytes(uint32_t rate, uint32_t channels,
   return 1;
 }
 
+/**
+ * @brief 回滚增加的下行播放句柄计数 (在 open 流程失败时调用)
+ */
+static void rollback_downstream_handle(private_t *tech_pvt) {
+  if (!tech_pvt || !tech_pvt->downstream_mutex) return;
+  switch_mutex_lock(tech_pvt->downstream_mutex);
+  unsigned int handles = switch_atomic_read(&tech_pvt->downstream_handles);
+  if (handles > 0) --handles;
+  switch_atomic_set(&tech_pvt->downstream_handles, handles);
+  switch_atomic_set(&tech_pvt->downstream_active, handles > 0 ? 1U : 0U);
+  if (handles == 0) {
+    switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
+  }
+  switch_mutex_unlock(tech_pvt->downstream_mutex);
+}
+
 switch_status_t audio_fork_ws_file_open(switch_file_handle_t *handle, const char *path) {
   if (!handle || !path) return SWITCH_STATUS_FALSE;
+  /* 下行驱动仅支持播放 (READ), 不支持写入 (WRITE) */
   if (switch_test_flag(handle, SWITCH_FILE_FLAG_WRITE)) return SWITCH_STATUS_NOTIMPL;
 
   const char *p = path;
@@ -72,6 +122,7 @@ switch_status_t audio_fork_ws_file_open(switch_file_handle_t *handle, const char
   size_t path_len = strnlen(p, MAX_PATH_LEN + MAX_BUG_LEN + 3);
   if (path_len == 0 || path_len > MAX_PATH_LEN + MAX_BUG_LEN + 1) return SWITCH_STATUS_FALSE;
 
+  /* 解析路径中的 UUID、可选的 bugname 与查询参数 (?query) */
   char mypath[MAX_PATH_LEN + MAX_BUG_LEN + 2];
   memcpy(mypath, p, path_len);
   mypath[path_len] = '\0';
@@ -90,6 +141,7 @@ switch_status_t audio_fork_ws_file_open(switch_file_handle_t *handle, const char
   const char *uuid = mypath;
   if (zstr(uuid) || strlen(uuid) >= MAX_SESSION_ID) return SWITCH_STATUS_FALSE;
 
+  /* 检索并锁定关联的 FreeSWITCH 核心会话 (获取 rwlock) */
   switch_core_session_t *lsession = switch_core_session_locate(uuid);
   if (!lsession) return SWITCH_STATUS_FALSE;
   switch_channel_t *channel = switch_core_session_get_channel(lsession);
@@ -127,6 +179,8 @@ switch_status_t audio_fork_ws_file_open(switch_file_handle_t *handle, const char
   channels = tech_pvt->downstream_channels ? tech_pvt->downstream_channels : 1;
   session_samplerate = samplerate;
   session_channels = channels;
+
+  /* 校验可选参数: rate 与 sampling 别名、channels 与 watchdog */
   if (query && parse_query_uint(query, "rate", 64000, &samplerate, &present) < 0) goto invalid_query;
   if (query && parse_query_uint(query, "sampling", 64000, &sampling_value, &sampling_present) < 0) goto invalid_query;
   if (sampling_present && present && sampling_value != samplerate) goto invalid_query;
@@ -142,6 +196,7 @@ switch_status_t audio_fork_ws_file_open(switch_file_handle_t *handle, const char
                       "mod_audio_fork: WebSocket URL 的 prebuffer 参数已被模组忽略, 使用 ws-prebuffer-ms=%u ms\n",
                       prebuffer_ms);
   }
+
   /* speak_start 已经推进 generation; open 只记录当前代际, 不能再次推进,
      否则合法的 speak_start -> open 顺序会让句柄立即失效. */
   generation = tech_pvt->downstream_generation;
@@ -157,25 +212,13 @@ switch_status_t audio_fork_ws_file_open(switch_file_handle_t *handle, const char
 
   uint32_t prebuffer_bytes;
   if (!calculate_prebuffer_bytes(samplerate, channels, prebuffer_ms, &prebuffer_bytes)) {
-    switch_mutex_lock(tech_pvt->downstream_mutex);
-    unsigned int handles = switch_atomic_read(&tech_pvt->downstream_handles);
-    if (handles > 0) --handles;
-    switch_atomic_set(&tech_pvt->downstream_handles, handles);
-    switch_atomic_set(&tech_pvt->downstream_active, handles > 0 ? 1U : 0U);
-    if (handles == 0) switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
-    switch_mutex_unlock(tech_pvt->downstream_mutex);
+    rollback_downstream_handle(tech_pvt);
     switch_core_session_rwunlock(lsession);
     return SWITCH_STATUS_FALSE;
   }
   audio_fork_ws_ctx_t *ctx = (audio_fork_ws_ctx_t *)switch_core_alloc(handle->memory_pool, sizeof(*ctx));
   if (!ctx) {
-    switch_mutex_lock(tech_pvt->downstream_mutex);
-    unsigned int handles = switch_atomic_read(&tech_pvt->downstream_handles);
-    if (handles > 0) --handles;
-    switch_atomic_set(&tech_pvt->downstream_handles, handles);
-    switch_atomic_set(&tech_pvt->downstream_active, handles > 0 ? 1U : 0U);
-    if (handles == 0) switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
-    switch_mutex_unlock(tech_pvt->downstream_mutex);
+    rollback_downstream_handle(tech_pvt);
     switch_core_session_rwunlock(lsession);
     return SWITCH_STATUS_MEMERR;
   }
@@ -221,7 +264,9 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
   if (frame_bytes == 0 || *len > SIZE_MAX / frame_bytes) { *len = 0; return SWITCH_STATUS_FALSE; }
   const size_t bytes_requested = *len * frame_bytes;
   int report_partial = 0;
+
   switch_mutex_lock(tech_pvt->downstream_mutex);
+  /* 检查句柄有效性: 缓冲存在、代际匹配且未被打断 */
   if (!tech_pvt->downstream_buffer ||
       ctx->generation != tech_pvt->downstream_generation ||
       switch_atomic_read(&tech_pvt->downstream_interrupted)) {
@@ -231,6 +276,8 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
   }
   size_t inuse = switch_buffer_inuse(tech_pvt->downstream_buffer);
   int eof = (int)switch_atomic_read(&tech_pvt->downstream_eof);
+
+  /* 1. 起播预缓冲门控: 未达成预缓冲字节且流尚未结束前, 填充静音帧阻断 */
   if (!ctx->prebuffered && inuse < ctx->prebuffer_bytes && !eof) {
     ctx->silence_frames++;
     uint32_t max_silence = ctx->max_silence_frames;
@@ -241,6 +288,8 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
     return SWITCH_STATUS_SUCCESS;
   }
   ctx->prebuffered = 1;
+
+  /* 2. 正常读取数据: 仅读取对齐整帧的 PCM 数据 */
   size_t safe_inuse = inuse - (inuse % frame_bytes);
   if (safe_inuse > 0) {
     size_t to_read = bytes_requested < safe_inuse ? bytes_requested : safe_inuse;
@@ -252,8 +301,9 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
       ctx->silence_frames = 0;
       return SWITCH_STATUS_SUCCESS;
     }
-    /* 只有不完整采样帧时先按欠载补静音; 等 EOF 再报告协议错误. */
   }
+
+  /* 3. 流结束 (EOF) 处理 */
   if (eof) {
     if (tech_pvt->downstream_partial_len ||
         switch_atomic_read(&tech_pvt->downstream_partial_error) ||
@@ -264,11 +314,14 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
       }
     }
     switch_mutex_unlock(tech_pvt->downstream_mutex);
-    if (report_partial && ctx->session && tech_pvt->responseHandler)
+    if (report_partial && ctx->session && tech_pvt->responseHandler) {
       tech_pvt->responseHandler(ctx->session, EVENT_ERROR, (char *)"{\"code\":\"pcm_partial_frame\"}");
+    }
     *len = 0;
     return SWITCH_STATUS_FALSE;
   }
+
+  /* 4. 欠载静音补偿: 缓冲临时读空, 填充静音并递增看门狗 */
   ctx->silence_frames++;
   uint32_t max_silence = ctx->max_silence_frames;
   switch_mutex_unlock(tech_pvt->downstream_mutex);
