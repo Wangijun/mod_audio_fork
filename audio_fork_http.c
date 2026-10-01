@@ -394,6 +394,9 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
   handle->sections = 0;
   handle->seekable = 0;
   handle->speed = 0;
+  /* 模组底层已实现专有环形音频缓冲与起播预缓冲机制, 彻底禁用 FreeSWITCH 核心层冗余的 64KB 预缓冲,
+   * 杜绝核心层在首帧一次性抽干 64KB (2048ms) 导致实时流式音频瞬间读空并下溢 (对齐 mod_local_stream 实现) */
+  handle->pre_buffer_datalen = 0;
   return SWITCH_STATUS_SUCCESS;
 }
 
@@ -411,9 +414,9 @@ switch_status_t audio_fork_http_file_read(switch_file_handle_t *handle, void *da
   int err = (int)switch_atomic_read(&ctx->err);
   int abort = (int)switch_atomic_read(&ctx->abort_requested);
 
-  /* 若缓冲区为空, 但流尚未结束且未出错、未被打断, 最多阻塞 200ms 等待新数据写入 */
+  /* 若缓冲区为空, 但流尚未结束且未出错、未被打断, 最多阻塞 20ms 等待新数据写入 (避免长时间阻塞混音主线程) */
   while (inuse == 0 && !eof && !err && !abort) {
-    if (switch_thread_cond_timedwait(ctx->audio_cond, ctx->audio_mutex, 200000) != SWITCH_STATUS_SUCCESS) {
+    if (switch_thread_cond_timedwait(ctx->audio_cond, ctx->audio_mutex, 20000) != SWITCH_STATUS_SUCCESS) {
       break;
     }
     inuse = ctx->audio_buffer ? switch_buffer_inuse(ctx->audio_buffer) : 0;
@@ -447,7 +450,13 @@ switch_status_t audio_fork_http_file_read(switch_file_handle_t *handle, void *da
     return SWITCH_STATUS_FALSE;
   }
 
-  /* 2. 欠载补偿: 缓冲临时读空, 填充静音并统计 */
+  /* 2. 欠载补偿: 缓冲临时读空, 填充静音并统计.
+   * 单次静音补偿上限严格对齐单帧规格(如 20ms = 320 采样点), 严禁单次填充巨量静音(如 2048ms)破坏混音时钟与通道时序. */
+  size_t max_silence_samples = ctx->samplerate ? (ctx->samplerate * 20U / 1000U) : 320U;
+  if (*len > max_silence_samples) {
+    *len = max_silence_samples;
+    bytes_needed = *len * frame_bytes;
+  }
   memset(data, 0, bytes_needed);
   *len = bytes_needed / frame_bytes;
   ctx->silence_frames++;

@@ -246,6 +246,8 @@ switch_status_t audio_fork_ws_file_open(switch_file_handle_t *handle, const char
   handle->speed = 0;
   handle->pos = 0;
   handle->private_info = ctx;
+  /* 模组底层已实现专有环形音频缓冲与起播预缓冲机制, 彻底禁用 FreeSWITCH 核心层冗余的 64KB 预缓冲 */
+  handle->pre_buffer_datalen = 0;
   return SWITCH_STATUS_SUCCESS;
 
 invalid_query:
@@ -262,7 +264,7 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
   if (!tech_pvt || !tech_pvt->downstream_mutex) { *len = 0; return SWITCH_STATUS_FALSE; }
   const size_t frame_bytes = sizeof(int16_t) * ctx->channels;
   if (frame_bytes == 0 || *len > SIZE_MAX / frame_bytes) { *len = 0; return SWITCH_STATUS_FALSE; }
-  const size_t bytes_requested = *len * frame_bytes;
+  size_t bytes_requested = *len * frame_bytes;
   int report_partial = 0;
 
   switch_mutex_lock(tech_pvt->downstream_mutex);
@@ -279,6 +281,11 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
 
   /* 1. 起播预缓冲门控: 未达成预缓冲字节且流尚未结束前, 填充静音帧阻断 */
   if (!ctx->prebuffered && inuse < ctx->prebuffer_bytes && !eof) {
+    size_t max_silence_samples = ctx->samplerate ? (ctx->samplerate * 20U / 1000U) : 320U;
+    if (*len > max_silence_samples) {
+      *len = max_silence_samples;
+      bytes_requested = *len * frame_bytes;
+    }
     ctx->silence_frames++;
     uint32_t max_silence = ctx->max_silence_frames;
     switch_mutex_unlock(tech_pvt->downstream_mutex);
@@ -322,6 +329,11 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
   }
 
   /* 4. 欠载静音补偿: 缓冲临时读空, 填充静音并递增看门狗 */
+  size_t max_silence_samples = ctx->samplerate ? (ctx->samplerate * 20U / 1000U) : 320U;
+  if (*len > max_silence_samples) {
+    *len = max_silence_samples;
+    bytes_requested = *len * frame_bytes;
+  }
   ctx->silence_frames++;
   uint32_t max_silence = ctx->max_silence_frames;
   switch_mutex_unlock(tech_pvt->downstream_mutex);
