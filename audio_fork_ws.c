@@ -291,6 +291,7 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
     switch_mutex_unlock(tech_pvt->downstream_mutex);
     memset(data, 0, bytes_requested);
     *len = bytes_requested / frame_bytes;
+    handle->sample_count += *len;
     if (max_silence && ctx->silence_frames >= max_silence) { *len = 0; return SWITCH_STATUS_FALSE; }
     return SWITCH_STATUS_SUCCESS;
   }
@@ -305,6 +306,7 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
     if (bytes_read > 0) {
       switch_mutex_unlock(tech_pvt->downstream_mutex);
       *len = bytes_read / frame_bytes;
+      handle->sample_count += *len;
       ctx->silence_frames = 0;
       return SWITCH_STATUS_SUCCESS;
     }
@@ -339,6 +341,7 @@ switch_status_t audio_fork_ws_file_read(switch_file_handle_t *handle, void *data
   switch_mutex_unlock(tech_pvt->downstream_mutex);
   memset(data, 0, bytes_requested);
   *len = bytes_requested / frame_bytes;
+  handle->sample_count += *len;
   if (max_silence && ctx->silence_frames >= max_silence) { *len = 0; return SWITCH_STATUS_FALSE; }
   return SWITCH_STATUS_SUCCESS;
 }

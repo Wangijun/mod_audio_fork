@@ -415,10 +415,8 @@ switch_status_t audio_fork_http_file_read(switch_file_handle_t *handle, void *da
   int abort = (int)switch_atomic_read(&ctx->abort_requested);
 
   /* 若缓冲区为空, 但流尚未结束且未出错、未被打断, 最多阻塞 20ms 等待新数据写入 (避免长时间阻塞混音主线程) */
-  while (inuse == 0 && !eof && !err && !abort) {
-    if (switch_thread_cond_timedwait(ctx->audio_cond, ctx->audio_mutex, 20000) != SWITCH_STATUS_SUCCESS) {
-      break;
-    }
+  if (inuse == 0 && !eof && !err && !abort) {
+    switch_thread_cond_timedwait(ctx->audio_cond, ctx->audio_mutex, 20000);
     inuse = ctx->audio_buffer ? switch_buffer_inuse(ctx->audio_buffer) : 0;
     eof = (int)switch_atomic_read(&ctx->eof);
     err = (int)switch_atomic_read(&ctx->err);

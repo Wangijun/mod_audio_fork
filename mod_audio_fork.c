@@ -112,6 +112,9 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_audio_fork_runtime);
 static switch_status_t audio_fork_file_open(switch_file_handle_t *handle, const char *path) {
 	if (!handle || !path) return SWITCH_STATUS_FALSE;
 
+	/* 模组底层已实现专有环形音频缓冲与起播预缓冲机制, 彻底禁用 FreeSWITCH 核心层冗余的 64KB 预缓冲 (对齐 mod_local_stream) */
+	handle->pre_buffer_datalen = 0;
+
 	const char *p = path;
 	if (!strncasecmp(p, "audio_fork://", 13)) {
 		p += 13;
