@@ -15,7 +15,7 @@
  * @brief 解析 WebSocket 接收到的文本 JSON 载荷并提取信令类型
  *
  * 将传入的字符串反序列化为 cJSON 结构体, 同时提取其中的 "type" 字段 (如
- * "speak_start", "speak_done", "killAudio", "transcription", "transfer" 等).
+ * "speak_start", "speak_done", "kill_audio", "transcription" 等).
  * 若 JSON 中未包含 "type" 属性, 则默认分类为 "json".
  *
  * @param session 当前 FreeSWITCH 通话核心会话 (用于记录会话专属日志)

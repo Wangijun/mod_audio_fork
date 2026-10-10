@@ -18,7 +18,7 @@
  *    - FreeSWITCH 下行播放驱动 (audio_fork_ws_file_read) 从 downstream_buffer 读取并混音起播
  *
  * 3. 打断 (Barge-In) 与代际隔离 (Generations):
- *    - killAudio 信令: 即刻将 downstream_interrupted 置 1, 丢弃所有未播音频并通知 ESL
+ *    - kill_audio 信令: 即刻将 downstream_interrupted 置 1, 丢弃所有未播音频并通知 ESL
  *    - speak_start 信令: 开启新一代 (generation++), 清除上一句尾音, 旧播放句柄自动失效退出
  */
 
@@ -242,111 +242,102 @@ namespace {
   /**
    * @brief 解析并分发 WebSocket 下行 JSON 控制信令
    *
-   * 支持处理以下 8 种消息类型:
-   * 1. killAudio: 即时打断下行播放, 清空环形缓冲并通知 ESL 业务层;
+   * 优先处理流媒体控制与核心事件:
+   * 1. kill_audio: 即时打断下行播放, 清空环形缓冲并通知 ESL 业务层;
    * 2. speak_start: 开始播报新句子, 推进代际 (generation++), 清除上一句残留尾音;
    * 3. speak_done: 句子播报结束标记 (EOF);
    * 4. transcription: 实时 ASR 转写识别结果;
-   * 5. transfer: 呼叫转接控制信令;
-   * 6. disconnect: 挂断会话信令;
-   * 7. error: 远端错误通知;
-   * 8. json: 其他透传的自定义 JSON 载荷.
+   * 5. error: 远端业务或协议错误通知;
+   * 6. 通用/业务扩展信令 (如自定义事件): 统一作为 json 事件完整透传至 ESL.
    */
+  struct cJSON_Deleter {
+    void operator()(cJSON* ptr) const {
+      if (ptr) cJSON_Delete(ptr);
+    }
+  };
+  struct cJSON_String_Deleter {
+    void operator()(char* ptr) const {
+      if (ptr) free(ptr);
+    }
+  };
+
   void processIncomingMessage(private_t* tech_pvt, switch_core_session_t* session, const char* message) {
     if (!tech_pvt || !session || !message) return;
     try {
-    std::string msg = message;
-    std::string type;
-    cJSON* json = parse_json(session, msg, type);
-    if (json) {
-      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-        "(%u) processIncomingMessage - 收到 %s 消息: %s\n", tech_pvt->id, type.c_str(), message);
-      cJSON* jsonData = cJSON_GetObjectItem(json, "data");
-
-            if (0 == type.compare("killAudio")) {
-        if (tech_pvt->downstream_mutex) {
-          switch_mutex_lock(tech_pvt->downstream_mutex);
-          switch_atomic_set(&tech_pvt->downstream_interrupted, 1);
-          switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
-          switch_atomic_set(&tech_pvt->downstream_eof, 0);
-          tech_pvt->downstream_partial_len = 0;
-          if (tech_pvt->downstream_buffer) {
-            switch_buffer_zero(tech_pvt->downstream_buffer);
-          }
-          switch_mutex_unlock(tech_pvt->downstream_mutex);
-        }
-        cJSON* speakId = jsonData ? cJSON_GetObjectItem(jsonData, "speakId") : NULL;
-        const char* speakIdValue = cJSON_IsString(speakId) ? speakId->valuestring : "";
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-          "(%u) 收到 killAudio 信令, speakId=%s, 设置 interrupted=1 并丢弃后续旧音频\n",
-          tech_pvt->id, speakIdValue);
-        char* killPayload = jsonData ? cJSON_PrintUnformatted(jsonData) : NULL;
-        tech_pvt->responseHandler(session, EVENT_KILL_AUDIO, killPayload);
-        free(killPayload);
-      }
-      else if (0 == type.compare("speak_start")) {
-        if (tech_pvt->downstream_mutex) {
-          switch_mutex_lock(tech_pvt->downstream_mutex);
-          switch_atomic_set(&tech_pvt->downstream_accept_audio, 1);
-          switch_atomic_set(&tech_pvt->downstream_eof, 0);
-          tech_pvt->downstream_partial_len = 0;
-          /* 每个 speak_start 开启新的语音段; 清掉上一段尚未消费的 PCM,
-             避免旧播放句柄的尾音泄漏到新代际. */
-          if (tech_pvt->downstream_buffer) switch_buffer_zero(tech_pvt->downstream_buffer);
-          switch_atomic_set(&tech_pvt->downstream_partial_error, 0);
-          switch_atomic_set(&tech_pvt->downstream_partial_error_notified, 0);
-          switch_atomic_set(&tech_pvt->downstream_overrun_notified, 0);
-          tech_pvt->downstream_generation++;
-          /* 旧句柄通过 generation 不匹配退出. 全局 interrupted 必须复位,
-             否则旧句柄尚未 close 时到达的新句 PCM 会被误丢弃. */
-          switch_atomic_set(&tech_pvt->downstream_interrupted, 0);
-          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-            "(%u) 收到 speak_start 文本信令, 开启新代际并接收新句 PCM(旧播放句柄数=%u)\n",
-            tech_pvt->id, switch_atomic_read(&tech_pvt->downstream_handles));
-          switch_mutex_unlock(tech_pvt->downstream_mutex);
-        }
-      }
-      else if (0 == type.compare("speak_done")) {
-        if (tech_pvt->downstream_mutex) {
-          switch_mutex_lock(tech_pvt->downstream_mutex);
-          switch_atomic_set(&tech_pvt->downstream_eof, 1);
-          switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
-          switch_mutex_unlock(tech_pvt->downstream_mutex);
-        }
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-          "(%u) 收到 speak_done 文本信令定稿标记\n", tech_pvt->id);
-      }
-      else if (0 == type.compare("transcription")) {
-        char* jsonString = cJSON_PrintUnformatted(jsonData);
-        tech_pvt->responseHandler(session, EVENT_TRANSCRIPTION, jsonString);
-        free(jsonString);
-      }
-      else if (0 == type.compare("transfer")) {
-        char* jsonString = cJSON_PrintUnformatted(jsonData);
-        tech_pvt->responseHandler(session, EVENT_TRANSFER, jsonString);
-        free(jsonString);
-      }
-      else if (0 == type.compare("disconnect")) {
-        char* jsonString = cJSON_PrintUnformatted(jsonData);
-        tech_pvt->responseHandler(session, EVENT_DISCONNECT, jsonString);
-        free(jsonString);
-      }
-      else if (0 == type.compare("error")) {
-        char* jsonString = cJSON_PrintUnformatted(jsonData);
-        tech_pvt->responseHandler(session, EVENT_ERROR, jsonString);
-        free(jsonString);
-      }
-      else if (0 == type.compare("json")) {
-        char* jsonString = cJSON_PrintUnformatted(json);
-        tech_pvt->responseHandler(session, EVENT_JSON, jsonString);
-        free(jsonString);
-      }
-      else {
+      std::string msg = message;
+      std::string type;
+      std::unique_ptr<cJSON, cJSON_Deleter> json(parse_json(session, msg, type));
+      if (json) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-          "(%u) processIncomingMessage - 忽略或自定义消息类型: %s\n", tech_pvt->id, type.c_str());
+          "(%u) processIncomingMessage - 收到 %s 消息: %s\n", tech_pvt->id, type.c_str(), message);
+        cJSON* jsonData = cJSON_GetObjectItem(json.get(), "data");
+
+        if (0 == type.compare("kill_audio")) {
+          if (tech_pvt->downstream_mutex) {
+            switch_mutex_lock(tech_pvt->downstream_mutex);
+            switch_atomic_set(&tech_pvt->downstream_interrupted, 1);
+            switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
+            switch_atomic_set(&tech_pvt->downstream_eof, 0);
+            tech_pvt->downstream_partial_len = 0;
+            if (tech_pvt->downstream_buffer) {
+              switch_buffer_zero(tech_pvt->downstream_buffer);
+            }
+            switch_mutex_unlock(tech_pvt->downstream_mutex);
+          }
+          cJSON* speakId = jsonData ? cJSON_GetObjectItem(jsonData, "speakId") : NULL;
+          const char* speakIdValue = cJSON_IsString(speakId) ? speakId->valuestring : "";
+          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+            "(%u) 收到 kill_audio 信令, speakId=%s, 设置 interrupted=1 并丢弃后续旧音频\n",
+            tech_pvt->id, speakIdValue);
+          std::unique_ptr<char, cJSON_String_Deleter> killPayload(jsonData ? cJSON_PrintUnformatted(jsonData) : NULL);
+          tech_pvt->responseHandler(session, EVENT_KILL_AUDIO, killPayload.get());
+        }
+        else if (0 == type.compare("speak_start")) {
+          if (tech_pvt->downstream_mutex) {
+            switch_mutex_lock(tech_pvt->downstream_mutex);
+            switch_atomic_set(&tech_pvt->downstream_accept_audio, 1);
+            switch_atomic_set(&tech_pvt->downstream_eof, 0);
+            tech_pvt->downstream_partial_len = 0;
+            /* 每个 speak_start 开启新的语音段; 清掉上一段尚未消费的 PCM,
+               避免旧播放句柄的尾音泄漏到新代际. */
+            if (tech_pvt->downstream_buffer) switch_buffer_zero(tech_pvt->downstream_buffer);
+            switch_atomic_set(&tech_pvt->downstream_partial_error, 0);
+            switch_atomic_set(&tech_pvt->downstream_partial_error_notified, 0);
+            switch_atomic_set(&tech_pvt->downstream_overrun_notified, 0);
+            tech_pvt->downstream_generation++;
+            /* 旧句柄通过 generation 不匹配退出. 全局 interrupted 必须复位,
+               否则旧句柄尚未 close 时到达的新句 PCM 会被误丢弃. */
+            switch_atomic_set(&tech_pvt->downstream_interrupted, 0);
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+              "(%u) 收到 speak_start 文本信令, 开启新代际并接收新句 PCM(旧播放句柄数=%u)\n",
+              tech_pvt->id, switch_atomic_read(&tech_pvt->downstream_handles));
+            switch_mutex_unlock(tech_pvt->downstream_mutex);
+          }
+        }
+        else if (0 == type.compare("speak_done")) {
+          if (tech_pvt->downstream_mutex) {
+            switch_mutex_lock(tech_pvt->downstream_mutex);
+            switch_atomic_set(&tech_pvt->downstream_eof, 1);
+            switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
+            switch_mutex_unlock(tech_pvt->downstream_mutex);
+          }
+          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+            "(%u) 收到 speak_done 文本信令定稿标记\n", tech_pvt->id);
+        }
+        else if (0 == type.compare("transcription")) {
+          std::unique_ptr<char, cJSON_String_Deleter> jsonString(cJSON_PrintUnformatted(jsonData));
+          tech_pvt->responseHandler(session, EVENT_TRANSCRIPTION, jsonString.get());
+        }
+        else if (0 == type.compare("error")) {
+          std::unique_ptr<char, cJSON_String_Deleter> jsonString(cJSON_PrintUnformatted(jsonData));
+          tech_pvt->responseHandler(session, EVENT_ERROR, jsonString.get());
+        }
+        else {
+          /* 其他所有业务或自定义信令（包括业务自定义扩展），统一通过 json 事件完整透传至 ESL 业务层 */
+          std::unique_ptr<char, cJSON_String_Deleter> jsonString(cJSON_PrintUnformatted(json.get()));
+          tech_pvt->responseHandler(session, EVENT_JSON, jsonString.get());
+        }
       }
-      cJSON_Delete(json);
-    }
     else {
       switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
         "(%u) processIncomingMessage - 无法解析 JSON 消息: %s\n", tech_pvt->id, message);
@@ -380,6 +371,7 @@ namespace {
       tech_pvt->pAudioPipe = nullptr;
       owner = true;
     }
+    switch_atomic_set(&tech_pvt->lifecycle_state, AUDIO_FORK_LIFECYCLE_CLOSING);
     if (tech_pvt->mutex) switch_mutex_unlock(tech_pvt->mutex);
     if (owner) pipe->releaseOwner();
 
@@ -811,11 +803,6 @@ namespace {
     }
     switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
     switch_atomic_set(&tech_pvt->downstream_interrupted, 1);
-    for (unsigned int wait_ms = 0;
-         wait_ms < 2000 && switch_atomic_read(&tech_pvt->downstream_handles) != 0;
-         wait_ms += 10) {
-      switch_yield(10000);
-    }
     if (tech_pvt->downstream_mutex) {
       switch_mutex_lock(tech_pvt->downstream_mutex);
       if (tech_pvt->downstream_buffer && switch_atomic_read(&tech_pvt->downstream_handles) == 0) {
@@ -1278,6 +1265,10 @@ extern "C" {
     private_t* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
     size_t available = 0;
     if (!tech_pvt) return SWITCH_TRUE;
+    /* 若生命周期处于 CLOSING / CLOSED, 返回 SWITCH_FALSE 让 FreeSWITCH 核心自动安全解挂 Media Bug */
+    if (switch_atomic_read(&tech_pvt->lifecycle_state) != AUDIO_FORK_LIFECYCLE_ACTIVE) {
+      return SWITCH_FALSE;
+    }
     if (switch_atomic_read(&tech_pvt->audio_paused) || switch_atomic_read(&tech_pvt->cleanup_started)) return SWITCH_TRUE;
 
     if (switch_mutex_trylock(tech_pvt->mutex) == SWITCH_STATUS_SUCCESS) {

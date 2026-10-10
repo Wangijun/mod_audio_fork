@@ -674,7 +674,7 @@ done:
  *
  * 加载顺序:
  * 1. 加载 XML 预缓冲配置 (audio_fork_load_config);
- * 2. 注册 10 个自定义事件子类 (EVENT_TRANSCRIPTION, EVENT_KILL_AUDIO 等);
+ * 2. 注册 8 个自定义事件子类 (EVENT_TRANSCRIPTION, EVENT_KILL_AUDIO 等);
  * 3. 注册 uuid_audio_fork API 接口;
  * 4. 注册 switch_file_interface ("audio_fork") 双模流式文件驱动;
  * 5. 初始化 LWS 服务线程与工作线程 (fork_init).
@@ -696,8 +696,6 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
 
 	/* 创建/注册自定义事件消息类型 */
 	if (switch_event_reserve_subclass(EVENT_TRANSCRIPTION) != SWITCH_STATUS_SUCCESS ||
-		switch_event_reserve_subclass(EVENT_TRANSFER) != SWITCH_STATUS_SUCCESS ||
-		switch_event_reserve_subclass(EVENT_PLAY_AUDIO) != SWITCH_STATUS_SUCCESS ||
 		switch_event_reserve_subclass(EVENT_KILL_AUDIO) != SWITCH_STATUS_SUCCESS ||
 		switch_event_reserve_subclass(EVENT_ERROR) != SWITCH_STATUS_SUCCESS ||
 		switch_event_reserve_subclass(EVENT_DISCONNECT) != SWITCH_STATUS_SUCCESS ||
@@ -726,8 +724,6 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
 	if (fork_init() != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "mod_audio_fork: 初始化失败\n");
 		switch_event_free_subclass(EVENT_TRANSCRIPTION);
-		switch_event_free_subclass(EVENT_TRANSFER);
-		switch_event_free_subclass(EVENT_PLAY_AUDIO);
 		switch_event_free_subclass(EVENT_KILL_AUDIO);
 		switch_event_free_subclass(EVENT_DISCONNECT);
 		switch_event_free_subclass(EVENT_ERROR);
@@ -748,7 +744,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
  *
  * 卸载顺序:
  * 1. 停止事件线程并释放 LWS 连接池 (fork_cleanup);
- * 2. 注销全部 10 个自定义事件子类;
+ * 2. 注销全部 8 个自定义事件子类;
  * 3. 释放模块接口资源.
  *
  * @return switch_status_t 成功返回 SWITCH_STATUS_SUCCESS
@@ -757,8 +753,6 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown)
 {
 	fork_cleanup();
 	switch_event_free_subclass(EVENT_TRANSCRIPTION);
-	switch_event_free_subclass(EVENT_TRANSFER);
-	switch_event_free_subclass(EVENT_PLAY_AUDIO);
 	switch_event_free_subclass(EVENT_KILL_AUDIO);
 	switch_event_free_subclass(EVENT_DISCONNECT);
 	switch_event_free_subclass(EVENT_ERROR);

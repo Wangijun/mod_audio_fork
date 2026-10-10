@@ -14,7 +14,7 @@ cJSON* parse_json(switch_core_session_t* session, const std::string& data, std::
     return NULL;
   }
 
-  /* 提取业务信令类型标记 (例如 speak_start, speak_done, killAudio, transcription 等) */
+  /* 提取业务信令类型标记 (例如 speak_start, speak_done, kill_audio, transcription 等) */
   const char *szType = cJSON_GetObjectCstr(json, "type");
   if (szType) {
     type.assign(szType);

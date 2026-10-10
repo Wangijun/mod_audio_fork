@@ -180,6 +180,11 @@ int AudioPipe::lws_callback(struct lws *wsi,
           ap->m_state.store(LWS_CLIENT_FAILED, std::memory_order_release);
           /* 连接失败也必须撤销尚未处理的 disconnect/write 引用, 避免保留失效对象 */
           removeFromPendingLists(ap);
+          if (ap->m_recv_buf) {
+            free(ap->m_recv_buf);
+            ap->m_recv_buf = ap->m_recv_buf_ptr = nullptr;
+            ap->m_recv_buf_len = 0;
+          }
           /* CLIENT_CONNECTION_ERROR 之后 libwebsockets 不再拥有可用 wsi; 清空避免后续重入 */
           ap->m_wsi = nullptr;
           ap->m_vhd = nullptr;
@@ -250,6 +255,11 @@ int AudioPipe::lws_callback(struct lws *wsi,
         }
         ap->m_state.store(LWS_CLIENT_DISCONNECTED, std::memory_order_release);
 
+        if (ap->m_recv_buf) {
+          free(ap->m_recv_buf);
+          ap->m_recv_buf = ap->m_recv_buf_ptr = nullptr;
+          ap->m_recv_buf_len = 0;
+        }
         *ppAp = NULL;
         removeFromPendingLists(ap);
         /* CLIENT_CLOSED 之后 wsi 已经失效; 清空句柄并归还 LWS 持有的引用 */
@@ -299,7 +309,11 @@ int AudioPipe::lws_callback(struct lws *wsi,
         /* 2. 文本信令帧处理 (JSON 分片动态拼接) */
         else {
           if (lws_is_first_fragment(wsi)) {
-            assert(nullptr == ap->m_recv_buf);
+            if (ap->m_recv_buf) {
+              free(ap->m_recv_buf);
+              ap->m_recv_buf = ap->m_recv_buf_ptr = nullptr;
+              ap->m_recv_buf_len = 0;
+            }
             size_t remaining_payload = lws_remaining_packet_payload(wsi);
             if (remaining_payload > MAX_RECV_BUF_SIZE || len > MAX_RECV_BUF_SIZE - remaining_payload) {
               ap->m_recv_buf_len = 0;
@@ -1058,7 +1072,9 @@ bool AudioPipe::connect_client(struct lws_per_vhost_data *vhd) {
   if (m_wsi) {
     try {
       std::lock_guard<std::mutex> guard(mutex_connects);
-      pendingConnectsByWsi[m_wsi] = this;
+      if (m_state.load(std::memory_order_acquire) == LWS_CLIENT_CONNECTING) {
+        pendingConnectsByWsi[m_wsi] = this;
+      }
     } catch (const std::exception& ex) {
       switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
         "AudioPipe: 保存连接索引失败: %s\n", ex.what());

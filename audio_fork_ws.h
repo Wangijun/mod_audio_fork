@@ -13,7 +13,7 @@
  * 2. 代际隔离: 每次 speak_start 会递增 downstream_generation, 使过期播放句柄自动失效并退出, 杜绝串音;
  * 3. 起播预缓冲: 累积满 ws-prebuffer-ms (默认 200ms) 数据后方才起播, 避免卡顿爆音;
  * 4. 欠载看门狗: 缓冲读空时自动补静音帧, 连续欠载超过 watchdog 限制 (默认 3000ms) 时安全结束播放;
- * 5. 即时打断: 收到 killAudio 信令时原子清空缓冲并标记 interrupted=1, 播放器立即中断.
+ * 5. 即时打断: 收到 kill_audio 信令时原子清空缓冲并标记 interrupted=1, 播放器立即中断.
  */
 
 #ifndef __AUDIO_FORK_WS_H__

@@ -10,7 +10,7 @@
  *    - downstream_active: 标记当前是否有活跃的下行播放句柄;
  *    - downstream_generation: 代际计数器, speak_start 推进代际, 句柄如果 generation 不匹配则判定为旧播报并优雅退出;
  *    - downstream_partial: 字节对齐缓冲区, 处理跨 WebSocket 碎片边界的奇数字节 (不足 1 个完整 16-bit 采样);
- *    - downstream_interrupted: 即时打断标记, 收到 killAudio 信令后置 1 并清空环形缓冲.
+ *    - downstream_interrupted: 即时打断标记, 收到 kill_audio 信令后置 1 并清空环形缓冲.
  */
 
 #include "audio_fork_ws.h"
@@ -365,9 +365,11 @@ switch_status_t audio_fork_ws_file_close(switch_file_handle_t *handle) {
       ctx->tech_pvt->downstream_partial_len = 0;
       if (ctx->tech_pvt->downstream_buffer) switch_buffer_zero(ctx->tech_pvt->downstream_buffer);
     }
-    if (switch_atomic_read(&ctx->tech_pvt->cleanup_started) &&
+    if ((switch_atomic_read(&ctx->tech_pvt->cleanup_started) ||
+         switch_atomic_read(&ctx->tech_pvt->lifecycle_state) != AUDIO_FORK_LIFECYCLE_ACTIVE) &&
         switch_atomic_read(&ctx->tech_pvt->downstream_handles) == 0 && ctx->tech_pvt->downstream_buffer) {
       switch_buffer_destroy(&ctx->tech_pvt->downstream_buffer);
+      ctx->tech_pvt->downstream_buffer = NULL;
     }
     switch_mutex_unlock(ctx->tech_pvt->downstream_mutex);
   }

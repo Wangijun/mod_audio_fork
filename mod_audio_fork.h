@@ -13,11 +13,11 @@
  * 2. 下行音频流 (Downstream):
  *    支持通过 FreeSWITCH 虚拟文件接口 (switch_file_interface) 播放远端音频流:
  *    - audio_fork_ws://<bugname>: WebSocket 全双工内存桥驱动, 直接播放来自远端 WebSocket
- *      下发的二进制 PCM 流, 支持 speak_start 代际切换、killAudio 即时打断 (Barge-In) 与 speak_done 定稿;
+ *      下发的二进制 PCM 流, 支持 speak_start 代际切换、kill_audio 即时打断 (Barge-In) 与 speak_done 定稿;
  *    - audio_fork_http://http://...: HTTP Chunked 流式播放驱动, 基于 libcurl 异步拉流,
  *      内置起播预缓冲 (pre-buffering) 与平滑防卡顿机制;
  * 3. 业务事件通道 (Control Plane):
- *    支持收发 JSON 格式的文本信令 (如 transcription, killAudio, transfer, disconnect 等),
+ *    支持收发 JSON 格式的文本信令 (如 transcription, kill_audio 等),
  *    通过 FreeSWITCH SWITCH_EVENT_CUSTOM 事件系统向 ESL/业务层通知状态.
  */
 
@@ -50,8 +50,6 @@ extern uint32_t audio_fork_http_prebuffer_ms;
  * @{
  */
 #define EVENT_TRANSCRIPTION   "mod_audio_fork::transcription"   /**< ASR 转写识别结果 */
-#define EVENT_TRANSFER        "mod_audio_fork::transfer"        /**< 呼叫转接控制信令 */
-#define EVENT_PLAY_AUDIO      "mod_audio_fork::play_audio"      /**< 远端触发播放音频事件 */
 #define EVENT_KILL_AUDIO      "mod_audio_fork::kill_audio"      /**< 远端触发打断停止播放事件 (Barge-In) */
 #define EVENT_DISCONNECT      "mod_audio_fork::disconnect"      /**< 远端连接断开通知 */
 #define EVENT_ERROR           "mod_audio_fork::error"           /**< 业务或协议错误通知 */
@@ -129,7 +127,7 @@ struct private_data {
   switch_mutex_t              *downstream_mutex;        /**< 下行缓冲区保护互斥锁 */
   switch_atomic_t              downstream_active;        /**< 下行播放文件句柄是否活跃 (原子标志) */
   switch_atomic_t              downstream_eof;           /**< 服务端是否已下发定稿标记 (speak_done 或零长帧) */
-  switch_atomic_t              downstream_interrupted;   /**< 是否被打断 (killAudio / uuid_break) */
+  switch_atomic_t              downstream_interrupted;   /**< 是否被打断 (kill_audio / uuid_break) */
   switch_atomic_t              downstream_accept_audio;  /**< 是否接受下行音频写入 (speak_start 开启, EOF/打断关闭) */
   switch_atomic_t              downstream_partial_error; /**< 是否收到非整采样字节错误 */
   switch_atomic_t              downstream_partial_error_notified; /**< 非整采样错误是否已输出日志通知 */
