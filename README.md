@@ -12,8 +12,8 @@
 - **严格 PCM 契约** — 下行只接受交错 S16LE（16-bit little-endian、无 WAV/MP3 头）；WebSocket 分片可在任意字节边界切分
 - **秒级极速打断** — 关闭播放时主动 shutdown 套接字，瞬间解除 curl 阻塞极速释放
 - **多种混音类型** — 单声道（仅主叫）、混合（主叫 + 被叫）或立体声（独立声道）
-- **灵活的采样率** — 上行 8000..64000 Hz 且必须是 8000 的整数倍；HTTP 下行 8000..48000 Hz 可使用任意整数
-- **自动重采样** — 内置 Speex 重采样器，用于采样率转换
+- **灵活的采样率** — 上行 8000..64000 Hz 且必须是 8000 的整数倍；HTTP 源率 8000..48000 Hz、WS 源率 8000..64000 Hz，均为 8000 的整数倍
+- **自动重采样** — 上行保持原有 Speex 行为；下行在生产者端按 `SWITCH_RESAMPLE_QUALITY` 转成通道播放率，环形缓冲只存输出率 PCM
 - **TLS 支持** — 安全 WebSocket 连接（wss://）
 - **SIMD 优化** — AVX2/SSE2 向量数学运算用于音频处理
 - **优雅关闭** — 关闭连接前排空音频缓冲区
@@ -129,7 +129,7 @@ playback(audio_fork://<uuid>[:<bugname>][?query_parameters])
 
 | 参数名 | 描述 | 默认值 | 取值范围与说明 |
 |---|---|---|---|
-| `rate` / `sampling` | 下行音频采样率 (Hz) | `16000` | 必须与会话 `start` 时的目标采样率一致（如 `8000`、`16000`） |
+| `rate` / `sampling` | 下行 PCM 源采样率 (Hz) | 本句 `speak_start.data.rate`，否则继承 `start` | `8000..64000` 且为 8000 整数倍；两别名同时声明时必须相同 |
 | `channels` | 音频声道数 | `1` | `1`（单声道 Mono）或 `2`（立体声 Stereo），须与会话一致 |
 | `watchdog` | 静音看门狗超时时间 (ms) | `3000` | 缓冲读空持续此时长后安全退出播放；设为 `0` 可关闭看门狗 |
 | `playback` | 业务自定义透传播放标识 | — | 驱动忽略该参数，FreeSWITCH 的 `PLAYBACK_STOP` 路径仍保留供业务匹配 |
@@ -163,7 +163,7 @@ playback(audio_fork://http[s]://<host>:<port>/<path>[?query_parameters])
 
 | 参数名 | 描述 | 默认值 | 取值范围与说明 |
 |---|---|---|---|
-| `rate` / `sampling` | HTTP 音频采样率 (Hz) | `16000` | `8000` ~ `48000`，允许任意整数 |
+| `rate` / `sampling` | HTTP PCM 源采样率 (Hz) | `16000` | `8000..48000`，必须为 8000 的整数倍；两别名同时声明时必须相同 |
 | `channels` | 音频声道数 | `1` | `1`（单声道 Mono）或 `2`（立体声 Stereo） |
 | `prebuffer` | 已弃用；模组忽略并记录提示，HTTP 原始查询串仍传给上游 | — | 预缓冲仅由 `audio_fork.conf.xml` 中的独立配置项控制 |
 | `watchdog` | 静音看门狗超时时间 (ms) | `3000` | 连续无数据输入达此时长后安全退出播放；设为 `0` 可关闭看门狗 |
@@ -181,7 +181,7 @@ playback(audio_fork://http[s]://<host>:<port>/<path>[?query_parameters])
 </configuration>
 ```
 
-配置文件缺失或某项缺失时，该路径使用默认 `200` ms。两项均必须是 `1`～`5000` 的整数；无效值会阻止模块加载并指出字段。HTTP 和 WebSocket URL 的 `?prebuffer=` 均不会覆盖配置，模组会记录忽略提示。HTTP 原始查询串仍会传给上游服务；慢流在等待约 1 秒后达到 500 ms 数据量时仍可降级起播。修改 XML 后先执行 `reloadxml`，再在无活跃通话时重启容器加载新模块。加载日志会输出两项配置值，每次播放日志会输出所采用的预缓冲值。
+配置文件缺失或某项缺失时，该路径使用默认 `200` ms。两项均必须是 `1`～`5000` 的整数；无效值会阻止模块加载并指出字段。HTTP 和 WebSocket URL 的 `?prebuffer=` 均不会覆盖配置，模组会记录忽略提示。HTTP 原始查询串仍会传给上游服务；慢流在等待约 1 秒后达到 500 ms 数据量时仍可降级起播。修改 XML 后先执行 `reloadxml`，再在无活跃通话时卸载并重新加载模块。加载日志会输出两项配置值，每次播放日志会输出所采用的预缓冲值。
 
 ##### 调用示例
 
@@ -219,7 +219,7 @@ mod_audio_fork 与远端 WebSocket 服务端采用全双工 WebSocket 长连接�
 ### 3. 下行音频流 (WebSocket Server -> FreeSWITCH)
 用于全双工双向实时交互（AI 话务员/语音大模型实时下发 TTS 音频）：
 - **帧类型**: WebSocket Binary Frame（二进制帧）。
-- **音频格式**: 裸线性 PCM（S16LE），采样率与声道须与通道会话一致。
+- **音频格式**: 裸线性 PCM（S16LE），源采样率默认继承 `start`，可由每句 `speak_start.data.rate` 显式指定；声道保持 `start` 的值。输出率在 fork 初始化时锁定为通道采样率。
 - **分片对齐**: 支持任意长度分片传输；模块内置跨帧字节对齐暂存器，自动修复单字节碎片，保证按整采样对齐。
 - **定稿结束标记 (EOF)**: 服务端播完一句语音后，可通过以下两种方式之一告知模块流结束：
   1. 发送一个**长度为 0 字节的二进制帧**；
@@ -230,7 +230,7 @@ mod_audio_fork 与远端 WebSocket 服务端采用全双工 WebSocket 长连接�
 
 | 信令 `type` | 格式示例 | 业务语义与 FreeSWITCH 动作 |
 |---|---|---|
-| `speak_start` | `{"type":"speak_start"}` | **开启新播报段**：重置下行代际计数器（`generation++`），清空缓冲区上一句残留的尾音，开始接收新一轮 PCM 数据。旧播放句柄因代际失效自动退出。 |
+| `speak_start` | `{"type":"speak_start","data":{"rate":24000}}`（`data.rate` 可省略） | **开启新播报段**：重置下行代际计数器（`generation++`），清空缓冲区上一句残留的尾音，开始接收新一轮 PCM 数据并复位转换器；省略 `rate` 时继承 `start`。旧播放句柄因代际失效自动退出。 |
 | `speak_done` | `{"type":"speak_done"}` | **句子定稿标记**：标记当前下行语音结束（标记 EOF），下游读缓冲区排干后文件句柄正常退出。 |
 | `kill_audio` | `{"type":"kill_audio","data":{"speakId":"s_1001"}}` | **即时打断 (Barge-In)**：立即丢弃下行环形缓冲中所有积压音频，将 `interrupted` 置 1 强制中断播放，并向 FreeSWITCH 事件总线抛出 `mod_audio_fork::kill_audio` 事件（携带 `speakId`）。 |
 | `transcription` | `{"type":"transcription","data":{"text":"你好","is_final":true}}` | **ASR 实时转写结果**：将 `data` 节点载荷向 FreeSWITCH 事件总线抛出 `mod_audio_fork::transcription` 事件，供业务层/ESL 订阅消费。 |
@@ -247,11 +247,11 @@ uuid_audio_fork <uuid> send_text [bugname] {"event":"dtmf","digit":"1"}
 
 ## 事件
 
-HTTP 和 WebSocket 下行流均为无头裸 PCM：采样率、声道数和位宽由 URL 或当前会话固定，服务端不得在一个流中改变格式。WebSocket 发送顺序为 `speak_start` 文本帧、一个或多个 binary PCM 帧、`speak_done` 文本帧或零长度 binary EOF 帧。binary 分片不要求与采样帧对齐；EOF 时仍有 1～3 个残余字节会报告 `pcm_partial_frame` 错误并终止。文件驱动不会返回 `SWITCH_STATUS_SUCCESS` 且长度为 0；欠载时返回请求帧数的静音，EOF 或停止时返回 `FALSE/0`。
+HTTP 和 WebSocket 下行流均为无头裸 PCM。URL 的 `rate`/`sampling` 一律表示源采样率，与 FreeSWITCH 请求的输出采样率分开；声道数保持既有规则，不增加混音策略。WS 信令声明优先：URL 显式声明与 `speak_start.data.rate` 冲突时打开失败；本句没有信令声明且还未收到任何音频字节时，URL 可补充源率；收到第一个字节后格式锁定，改变源率必须发新的 `speak_start`。WS 句柄请求的输出率与 fork 初始化的通道率不一致时打开失败。HTTP 没有关联 fork，未声明源率仍为 16000Hz。WebSocket 发送顺序为 `speak_start` 文本帧、一个或多个 binary PCM 帧、`speak_done` 文本帧或零长度 binary EOF 帧。binary 分片不要求与采样帧对齐；EOF 时仍有 1～3 个残余字节会报告 `pcm_partial_frame` 错误并终止。文件驱动不会返回 `SWITCH_STATUS_SUCCESS` 且长度为 0；活跃流把单次读取限制到最多 20ms，再对这次读取的不足部分补零，避免播放引擎一次预取 16384 个采样而提前缓存数秒静音。正常 EOF 先输出全部实际尾帧，排空后返回 `FALSE/0`。Speex 跳过起始滤波延迟，结束时用有限零输入排空；总输出帧数为 `ceil(输入帧数 × 输出率 / 源率)`，重复 EOF 不重复排空。
 
 `speak_start` 会推进播放代际并清空旧 PCM；旧句柄按代际不匹配退出，新句首帧即使在旧句柄关闭前到达也会进入缓冲。业务可在 WebSocket 播放 URL 上附加唯一 `?playback=<id>` 标识，文件驱动忽略该参数，FreeSWITCH 的 `PLAYBACK_STOP` 路径仍保留它供业务匹配。带 `data.speakId` 的 `kill_audio` 会把该标识透传至 `mod_audio_fork::kill_audio` 事件体，便于业务忽略迟到的旧句打断事件。
 
-`uuid_audio_fork stop`、`uuid_break` 和通道挂机会停止接收下行音频、取消连接并等待后台线程收尾；模块卸载会拒绝新连接并清理待处理连接。缓冲区写入失败或 HTTP 背压超过 250ms 会记录错误、发出一次 `buffer_overrun`/`error` 事件并终止流。
+`uuid_audio_fork stop`、`uuid_break` 和通道挂机会停止接收下行音频、取消连接并等待后台线程收尾；模块卸载会拒绝新连接并清理待处理连接。缓冲区写入失败、重采样失败或不完整输入采样均终止当前流并记录明确错误。WS 转换错误发出 `mod_audio_fork::error`（如 `pcm_partial_frame`）；WS 溢出发出 `buffer_overrun`。HTTP 背压超过 250ms 会记录错误并停止拉流；HTTP 4xx/5xx 响应体不会作为音频输出。HTTP 关闭时先 shutdown、唤醒并 join 生产者，再销毁转换器与缓冲。两条读端均不等待网络数据；看门狗以单调时间计算连续欠载，生产者写入有效 PCM 或读到有效音频会复位，`watchdog=0` 禁用。关闭当前代际的最后一个句柄会丢弃缓冲和滤波历史；旧代际关闭只释放自己的引用。
 
 本模块生成以下 FreeSWITCH 自定义事件：
 
@@ -268,7 +268,7 @@ HTTP 和 WebSocket 下行流均为无头裸 PCM：采样率、声道数和位宽
 
 ## 构建
 
-详细构建说明请参见 [BUILD.md](BUILD.md)。
+详细构建说明请参见 [BUILD.md](BUILD.md)，测试与部署记录见 [VALIDATION.md](VALIDATION.md)。
 
 ### 快速开始
 

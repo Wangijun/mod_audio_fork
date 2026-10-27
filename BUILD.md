@@ -25,7 +25,7 @@ sudo make install
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y cmake build-essential libwebsockets-dev
+sudo apt-get install -y cmake build-essential pkg-config libwebsockets-dev libspeex-dev libspeexdsp-dev libcurl4-openssl-dev
 ```
 
 ## 构建
@@ -95,16 +95,17 @@ sudo chown freeswitch:freeswitch /usr/local/freeswitch/mod/mod_audio_fork.so
 <load module="mod_audio_fork"/>
 ```
 
-### 2. 重启 FreeSWITCH
+### 2. 无活跃通话时重新加载模块
 
 ```bash
-sudo systemctl restart freeswitch
+fs_cli -x "show channels count"
+# 必须为 0；先备份现有模块并记录 sha256sum，再卸载、替换与加载。
+fs_cli -x "unload mod_audio_fork"
+# 安装至 fs_cli -x "global_getvar mod_dir" 返回的目录
+fs_cli -x "load mod_audio_fork"
 ```
 
-或从 fs_cli 重新加载：
-```bash
-fs_cli -x "reload mod_audio_fork"
-```
+不要强制卸载使用中的模块。加载或通话回归失败时，在无活跃通话后卸载候选模块、恢复备份并重新加载验证。既有 FreeSWITCH 服务无需重启。
 
 ### 3. 验证
 
@@ -140,3 +141,29 @@ fs_cli -x "console loglevel debug"
 ```bash
 ldd /usr/local/freeswitch/mod/mod_audio_fork.so
 ```
+
+## 对齐运行实例的 Trixie 构建与测试
+
+构建工程文档版本不代表运行版本。先查询运行实例 `version`、`global_getvar mod_dir`，核对其挂载的 SDK `lib/pkgconfig/freeswitch.pc`、头文件及 `libfreeswitch.so` 校验值。使用同一安装树的头文件和共享库，禁止混用其他 FreeSWITCH 安装树。
+
+以下路径由当前部署提供：`SDK_ROOT` 指运行容器实际挂载的安装树，`DEPS_ROOT` 指运行依赖目录，`RUNTIME_LIBS` 放置构建镜像缺少但运行容器使用的依赖库（例如 `libtpl.so.0`，须复制实际文件及对应 SONAME）。这些目录以只读方式挂载。
+
+```bash
+docker run --rm \
+  -v "$PWD:/src" -v "$SDK_ROOT:/sdk:ro" \
+  -v "$DEPS_ROOT:/deps:ro" -v "$RUNTIME_LIBS:/runtime-libs:ro" \
+  -e LD_LIBRARY_PATH=/sdk/lib:/deps:/runtime-libs \
+  freeswitch-builder:trixie bash -lc '
+    cmake -S /src -B /src/build/producer \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DFREESWITCH_INCLUDE_DIR=/sdk/include/freeswitch \
+      -DFREESWITCH_LIBRARY=/sdk/lib/libfreeswitch.so &&
+    cmake --build /src/build/producer -j8 &&
+    ctest --test-dir /src/build/producer --output-on-failure &&
+    ldd -r /src/build/producer/mod_audio_fork.so
+  '
+```
+
+`ldd -r` 必须没有 `not found` 或 `undefined symbol`。CTest 包含 `downstream_pcm`、`downstream_drivers`；驱动测试只初始化 APR 内存池，不启动 FreeSWITCH 服务，通过链接器包装计数确保 HTTP 读端没有条件等待。测试断言在 Release 构建中也保持有效。检查内存与未定义行为时，在单独的 `build/sanitized` 中为 C 编译器及可执行文件链接器加入 `-fsanitize=address,undefined`，仅构建两个测试目标后运行 CTest。
+
+本地 SIP/RTP 回归脚本、验收边界与回滚位置见 [VALIDATION.md](VALIDATION.md)。
