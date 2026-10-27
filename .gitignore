@@ -1,1 +1,8 @@
 build/
+__pycache__/
+*.pyc
+*.wav
+*.pcm
+*.rtp
+*.pcap
+*.log
