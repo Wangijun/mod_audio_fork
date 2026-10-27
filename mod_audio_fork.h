@@ -22,6 +22,7 @@
  */
 
 #include <switch.h>
+#include "downstream_pcm.h"
 #include <libwebsockets.h>
 #include <speex/speex_resampler.h>
 
@@ -129,12 +130,15 @@ struct private_data {
   switch_atomic_t              downstream_eof;           /**< 服务端是否已下发定稿标记 (speak_done 或零长帧) */
   switch_atomic_t              downstream_interrupted;   /**< 是否被打断 (kill_audio / uuid_break) */
   switch_atomic_t              downstream_accept_audio;  /**< 是否接受下行音频写入 (speak_start 开启, EOF/打断关闭) */
-  switch_atomic_t              downstream_partial_error; /**< 是否收到非整采样字节错误 */
-  switch_atomic_t              downstream_partial_error_notified; /**< 非整采样错误是否已输出日志通知 */
-  switch_atomic_t              downstream_overrun_notified;       /**< 下行缓冲区溢出告警是否已触发通知 */
+  switch_atomic_t              downstream_error; /**< 本代际是否发生协议/转换/缓冲错误 */
   switch_atomic_t              downstream_handles;       /**< 当前打开的下行虚拟播放句柄引用计数 */
-  uint8_t                      downstream_partial[4];   /**< 下行非整采样残余字节拼包暂存区 */
-  uint8_t                      downstream_partial_len;  /**< 残余暂存区当前字节长度 */
+  af_pcm_t                    *downstream_pcm;
+  uint32_t                     downstream_output_rate;
+  uint32_t                     downstream_default_rate;
+  uint32_t                     downstream_current_handles;
+  int                          downstream_rate_declared;
+  int                          downstream_audio_started;
+  uint64_t                     downstream_audio_serial;
   uint64_t                     downstream_generation;   /**< 下行句子代际计数器 (speak_start 递增, 隔离旧音频) */
   uint32_t                     downstream_sample_rate;  /**< 下行音频采样率 (默认 16000) */
   uint32_t                     downstream_channels;     /**< 下行音频声道数 (默认 1) */

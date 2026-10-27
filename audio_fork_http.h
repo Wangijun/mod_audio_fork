@@ -11,7 +11,7 @@
  *
  * 核心设计:
  * 1. 异步解耦: 独立的后台 switch_thread_t 运行 libcurl 传输循环, 不阻塞 FreeSWITCH 混音时钟;
- * 2. 背压与同步: 基于 switch_buffer_t 环形缓冲与 switch_thread_cond_t 条件变量, 支持生产/消费双向背压;
+ * 2. 背压与同步: 基于 switch_buffer_t 环形缓冲与 switch_thread_cond_t 条件变量, 生产者等待缓冲空间，消费者不等待网络数据;
  * 3. 即时解阻塞: 通道挂断或收到打断请求时, 通过 shutdown(curlfd, SHUT_RDWR) 强行中断套接字阻塞, 实现毫秒级退出;
  * 4. 起播缓冲门控: 预缓冲达到 http-prebuffer-ms (默认 200ms) 后开闸起播; 针对慢速流提供 500ms 降级门控;
  * 5. 欠载容错与统计: 缓冲瞬时读空时平滑填补静音帧, 并在播放结束时上报缓冲欠载统计.
@@ -28,8 +28,6 @@
 extern "C" {
 #endif
 
-/* 默认连续欠载 150 帧 (3000ms) 触发看门狗强退 */
-#define SILENCE_WATCHDOG_DEFAULT_FRAMES 150
 /* 裸 PCM16 动态环形池硬上限: 约 50 秒 16kHz 16-bit Mono (1.6 MB), 防爆内存且杜绝长播报丢帧 */
 #define MAX_AUDIO_FORK_BUFFER_BYTES     1600000
 
@@ -48,8 +46,11 @@ typedef struct audio_fork_http_ctx {
   switch_thread_t            *read_thread;        /**< 后台 curl 异步拉流线程 */
   curl_socket_t               curlfd;             /**< 底层 socket fd (关闭时 shutdown 即刻解阻塞) */
 
-  uint32_t                    samplerate;         /**< 目标采样率 (默认 16000) */
-  uint32_t                    channels;           /**< 目标声道数 (默认 1) */
+  af_pcm_t                   *pcm;
+  uint32_t                    source_rate;
+  uint64_t                    audio_serial;
+  uint32_t                    samplerate;         /**< 输出采样率 (FreeSWITCH 请求的播放率) */
+  uint32_t                    channels;           /**< PCM 声道数 (默认 1) */
   uint32_t                    prebuffer_bytes;    /**< 起播所需预缓冲字节门限 */
 
   switch_atomic_t             abort_requested;    /**< 打断/关闭标记: 1=立即终止拉流 */
@@ -57,10 +58,10 @@ typedef struct audio_fork_http_ctx {
   switch_atomic_t             err;                /**< 是否发生网络/HTTP 错误 */
   long                        http_response_code; /**< HTTP 响应状态码 (如 200) */
 
-  uint32_t                    silence_frames;     /**< 连续静音欠载帧计数 (看门狗) */
+  af_watchdog_t               watchdog;
+  uint32_t                    watchdog_ms;
   uint32_t                    underrun_frames;    /**< 播放期间缓冲读空的总次数 */
   uint64_t                    underrun_samples;   /**< 播放期间缓冲读空的总采样数 */
-  uint32_t                    max_silence_frames; /**< 静音看门狗最大帧阈值 */
 } audio_fork_http_ctx_t;
 
 /**

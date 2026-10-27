@@ -8,7 +8,7 @@
  *    - audio_fork_http_write_cb 回调在收到 chunked 裸 PCM 时写入 audio_buffer 环形缓冲;
  * 2. 线程同步与背压门控:
  *    - 缓冲区满时, 写入线程在 audio_cond 上等待最多 250ms (AUDIO_FORK_WRITE_WAIT_US);
- *    - 读取线程在缓冲空时调用 switch_thread_cond_timedwait 等待最多 200ms 新数据;
+ *    - 读取线程仅消费输出率 PCM；欠载立即补零，不等待网络数据;
  * 3. 即时打断 (Barge-In / Hangup):
  *    - 记录底层 socket fd (curlfd), 在需要退出时调用 shutdown(curlfd, SHUT_RDWR)
  *      强行打断阻塞在内核套接字读取上的 libcurl, 确保即刻退出并安全 join 线程;
@@ -136,6 +136,7 @@ static void audio_fork_http_cleanup_resources(audio_fork_http_ctx_t *ctx) {
     if (ctx->audio_cond) switch_thread_cond_broadcast(ctx->audio_cond);
     switch_mutex_unlock(ctx->audio_mutex);
   }
+  af_pcm_destroy(&ctx->pcm);
 }
 
 /**
@@ -149,6 +150,16 @@ static int audio_fork_http_sockopt_cb(void *clientp, curl_socket_t curlfd, curls
     ctx->curlfd = curlfd;
     switch_mutex_unlock(ctx->audio_mutex);
   }
+  return 0;
+}
+
+/* curl 关闭 fd 前撤销记录，避免 close/abort 竞态误 shutdown 被系统复用的描述符。 */
+static int audio_fork_http_closesocket_cb(void *clientp, curl_socket_t fd) {
+  audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)clientp;
+  switch_mutex_lock(ctx->audio_mutex);
+  if (ctx->curlfd == fd) ctx->curlfd = -1;
+  close(fd);
+  switch_mutex_unlock(ctx->audio_mutex);
   return 0;
 }
 
@@ -167,47 +178,38 @@ static int audio_fork_http_progress_cb(void *clientp, double dltotal, double dln
 /**
  * @brief libcurl 接收数据写入回调: 将接收到的裸 PCM chunk 写入环形缓冲区
  */
+static int http_pcm_sink(void *userdata, const int16_t *pcm, size_t total_bytes) {
+  audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)userdata;
+  uint64_t deadline = af_monotonic_us() + AUDIO_FORK_WRITE_WAIT_US;
+  switch_mutex_lock(ctx->audio_mutex);
+  while (!http_is_aborted(ctx) && ctx->audio_buffer) {
+    size_t inuse = switch_buffer_inuse(ctx->audio_buffer);
+    if (inuse <= MAX_AUDIO_FORK_BUFFER_BYTES && total_bytes <= MAX_AUDIO_FORK_BUFFER_BYTES - inuse) {
+      switch_buffer_write(ctx->audio_buffer, pcm, total_bytes);
+      int ok = switch_buffer_inuse(ctx->audio_buffer) == inuse + total_bytes;
+      if (ok) ++ctx->audio_serial;
+      switch_mutex_unlock(ctx->audio_mutex);
+      return ok ? 0 : -1;
+    }
+    if (af_monotonic_us() >= deadline) break;
+    switch_thread_cond_timedwait(ctx->audio_cond, ctx->audio_mutex, 5000);
+  }
+  switch_mutex_unlock(ctx->audio_mutex);
+  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[audio_fork] HTTP PCM 缓冲溢出或生产者背压超时\n");
+  return -1;
+}
+
 static size_t audio_fork_http_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
   audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)userdata;
-  if (!ctx || !ptr || size == 0 || nmemb > SIZE_MAX / size || http_is_aborted(ctx)) return 0;
-  size_t total_bytes = size * nmemb;
-  if (total_bytes == 0 || total_bytes > MAX_AUDIO_FORK_BUFFER_BYTES) {
+  if (!ctx || !ptr || !size || nmemb > SIZE_MAX / size || http_is_aborted(ctx)) return 0;
+  size_t bytes = size * nmemb;
+  int error = af_pcm_write(ctx->pcm, ptr, bytes, http_pcm_sink, ctx);
+  if (error) {
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[audio_fork] HTTP 下行转换失败: %s\n", af_pcm_error(error));
     set_http_error(ctx);
     return 0;
   }
-
-  switch_interval_time_t waited = 0;
-  /* 缓冲区满时进行背压等待 (最多等待 250ms) */
-  while (waited < AUDIO_FORK_WRITE_WAIT_US) {
-    switch_mutex_lock(ctx->audio_mutex);
-    if (http_is_aborted(ctx) || !ctx->audio_buffer) {
-      switch_mutex_unlock(ctx->audio_mutex);
-      return 0;
-    }
-    size_t inuse = switch_buffer_inuse(ctx->audio_buffer);
-    if (inuse <= MAX_AUDIO_FORK_BUFFER_BYTES && total_bytes <= MAX_AUDIO_FORK_BUFFER_BYTES - inuse) {
-      size_t before = inuse;
-      switch_buffer_write(ctx->audio_buffer, ptr, total_bytes);
-      size_t after = switch_buffer_inuse(ctx->audio_buffer);
-      /* 唤醒下游消费读线程 */
-      if (ctx->audio_cond) switch_thread_cond_signal(ctx->audio_cond);
-      switch_mutex_unlock(ctx->audio_mutex);
-      if (after >= before && after - before == total_bytes) return total_bytes;
-      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-        "[audio_fork] HTTP PCM 缓冲写入不足(请求=%zu, 实际=%zu), 中止流\n",
-        total_bytes, after >= before ? after - before : 0);
-      set_http_error(ctx);
-      return 0;
-    }
-    /* 等待消费者释放缓冲空间 */
-    if (ctx->audio_cond) switch_thread_cond_timedwait(ctx->audio_cond, ctx->audio_mutex, 5000);
-    switch_mutex_unlock(ctx->audio_mutex);
-    waited += 5000;
-  }
-  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-    "[audio_fork] HTTP PCM 缓冲区背压超时(250ms), 中止流\n");
-  set_http_error(ctx);
-  return 0;
+  return bytes;
 }
 
 /**
@@ -232,6 +234,7 @@ static void *SWITCH_THREAD_FUNC audio_fork_http_thread(switch_thread_t *thread, 
   switch_curl_easy_setopt(curl, CURLOPT_URL, ctx->stream_url);
   switch_curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   switch_curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  switch_curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
   switch_curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
   switch_curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
   switch_curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 100L);
@@ -252,6 +255,8 @@ static void *SWITCH_THREAD_FUNC audio_fork_http_thread(switch_thread_t *thread, 
 #endif
   curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, audio_fork_http_sockopt_cb);
   curl_easy_setopt(curl, CURLOPT_SOCKOPTDATA, (void *)ctx);
+  curl_easy_setopt(curl, CURLOPT_CLOSESOCKETFUNCTION, audio_fork_http_closesocket_cb);
+  curl_easy_setopt(curl, CURLOPT_CLOSESOCKETDATA, (void *)ctx);
 
   res = switch_curl_easy_perform(curl);
   switch_curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
@@ -269,6 +274,13 @@ static void *SWITCH_THREAD_FUNC audio_fork_http_thread(switch_thread_t *thread, 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
       "[audio_fork] HTTP 响应错误状态码: %ld [%s]\n", response_code, ctx->stream_url);
     set_http_error(ctx);
+  }
+  if (res == CURLE_OK && response_code < 400 && !http_is_aborted(ctx)) {
+    int error = af_pcm_finish(ctx->pcm, http_pcm_sink, ctx);
+    if (error) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "[audio_fork] HTTP EOF 转换失败: %s\n", af_pcm_error(error));
+      set_http_error(ctx);
+    }
   }
   switch_curl_easy_cleanup(curl);
   switch_mutex_lock(ctx->audio_mutex);
@@ -296,6 +308,8 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
   }
   if (!stream_url) return SWITCH_STATUS_MEMERR;
 
+  /* file_open 入口 samplerate 是核心请求的播放率，URL rate 是源率。 */
+  uint32_t output_rate = handle->samplerate;
   uint32_t samplerate = 16000, channels = 1, watchdog_ms = 3000;
   uint32_t prebuffer_ms = audio_fork_http_prebuffer_ms;
   char *query = strchr(stream_url, '?');
@@ -322,7 +336,7 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
   }
 
   uint32_t prebuffer_bytes;
-  if (!calculate_prebuffer_bytes(samplerate, channels, prebuffer_ms, &prebuffer_bytes)) return SWITCH_STATUS_FALSE;
+  if (!calculate_prebuffer_bytes(output_rate, channels, prebuffer_ms, &prebuffer_bytes)) return SWITCH_STATUS_FALSE;
 
   audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)switch_core_alloc(handle->memory_pool, sizeof(*ctx));
   if (!ctx) return SWITCH_STATUS_MEMERR;
@@ -330,11 +344,14 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
   ctx->driver_type = AUDIO_FORK_DRIVER_HTTP;
   ctx->pool = handle->memory_pool;
   ctx->stream_url = stream_url;
-  ctx->samplerate = samplerate;
+  ctx->source_rate = samplerate;
+  ctx->samplerate = output_rate;
+  ctx->pcm = af_pcm_create(samplerate, output_rate, channels, SWITCH_RESAMPLE_QUALITY);
+  if (!ctx->pcm) return SWITCH_STATUS_MEMERR;
   ctx->channels = channels;
   ctx->curlfd = -1;
   ctx->prebuffer_bytes = prebuffer_bytes;
-  ctx->max_silence_frames = watchdog_ms ? (watchdog_ms / 20U ? watchdog_ms / 20U : 1U) : 0;
+  ctx->watchdog_ms = watchdog_ms;
   switch_atomic_set(&ctx->abort_requested, 0);
   switch_atomic_set(&ctx->eof, 0);
   switch_atomic_set(&ctx->err, 0);
@@ -356,7 +373,7 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
 
   /* 起播预缓冲检测循环: 每 5ms 轮询一次, 最多等待 3000ms (600 次迭代) */
   int sanity = 600;
-  uint32_t degradation_bytes = (uint32_t)(((uint64_t)samplerate * channels * sizeof(int16_t) * 500U) / 1000U);
+  uint32_t degradation_bytes = (uint32_t)(((uint64_t)output_rate * channels * sizeof(int16_t) * 500U) / 1000U);
   while (--sanity > 0 && !switch_atomic_read(&ctx->abort_requested) && !switch_atomic_read(&ctx->err)) {
     switch_mutex_lock(ctx->audio_mutex);
     size_t inuse = ctx->audio_buffer ? switch_buffer_inuse(ctx->audio_buffer) : 0;
@@ -373,7 +390,7 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
   if (ctx->audio_cond) switch_thread_cond_signal(ctx->audio_cond);
   switch_mutex_unlock(ctx->audio_mutex);
 
-  if ((switch_atomic_read(&ctx->err) && initial_inuse == 0) ||
+  if (switch_atomic_read(&ctx->err) ||
       (switch_atomic_read(&ctx->eof) && initial_inuse == 0) ||
       (sanity <= 0 && initial_inuse == 0)) {
     set_http_error(ctx);
@@ -387,7 +404,7 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
                     initial_inuse < ctx->prebuffer_bytes ? ", 慢流降级或流结束" : "");
 
   handle->private_info = ctx;
-  handle->samplerate = samplerate;
+  handle->samplerate = output_rate;
   handle->channels = (uint8_t)channels;
   handle->real_channels = (uint8_t)channels;
   handle->format = 0;
@@ -401,79 +418,52 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
 }
 
 switch_status_t audio_fork_http_file_read(switch_file_handle_t *handle, void *data, size_t *len) {
-  if (!handle || !handle->private_info || !data || !len || *len == 0) return SWITCH_STATUS_FALSE;
+  if (!handle || !handle->private_info || !data || !len || !*len) return SWITCH_STATUS_FALSE;
   audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)handle->private_info;
   size_t frame_bytes = sizeof(int16_t) * ctx->channels;
   if (!frame_bytes || *len > SIZE_MAX / frame_bytes) { *len = 0; return SWITCH_STATUS_FALSE; }
-  size_t bytes_needed = *len * frame_bytes;
-  size_t bytes_read = 0;
-
+  size_t bytes = *len * frame_bytes, read = 0;
   switch_mutex_lock(ctx->audio_mutex);
-  size_t inuse = ctx->audio_buffer ? switch_buffer_inuse(ctx->audio_buffer) : 0;
   int eof = (int)switch_atomic_read(&ctx->eof);
-  int err = (int)switch_atomic_read(&ctx->err);
-  int abort = (int)switch_atomic_read(&ctx->abort_requested);
-
-  /* 若缓冲区为空, 但流尚未结束且未出错、未被打断, 最多阻塞 20ms 等待新数据写入 (避免长时间阻塞混音主线程) */
-  if (inuse == 0 && !eof && !err && !abort) {
-    switch_thread_cond_timedwait(ctx->audio_cond, ctx->audio_mutex, 20000);
-    inuse = ctx->audio_buffer ? switch_buffer_inuse(ctx->audio_buffer) : 0;
-    eof = (int)switch_atomic_read(&ctx->eof);
-    err = (int)switch_atomic_read(&ctx->err);
-    abort = (int)switch_atomic_read(&ctx->abort_requested);
+  /* playback 会预取 16384 个采样；活跃流只交付一个时钟帧，避免预填未来数秒静音。 */
+  if (!eof && *len > ctx->samplerate / 50U) {
+    *len = ctx->samplerate / 50U;
+    bytes = *len * frame_bytes;
   }
-
-  /* 1. 正常读取对齐的 PCM 数据 */
-  if (inuse > 0 && ctx->audio_buffer) {
-    size_t safe_inuse = inuse - (inuse % frame_bytes);
-    size_t to_read = bytes_needed < safe_inuse ? bytes_needed : safe_inuse;
-    if (to_read) bytes_read = switch_buffer_read(ctx->audio_buffer, data, to_read);
-    if (!err && eof && (inuse % frame_bytes) != 0 && safe_inuse == 0) {
-      switch_atomic_set(&ctx->err, 1);
-      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-        "[audio_fork] HTTP PCM 在 EOF 时存在不完整采样帧(剩余=%zu 字节)\n", inuse % frame_bytes);
-    }
+  int failed = switch_atomic_read(&ctx->err) || switch_atomic_read(&ctx->abort_requested);
+  if (!failed && ctx->audio_buffer) {
+    size_t inuse = switch_buffer_inuse(ctx->audio_buffer);
+    read = switch_buffer_read(ctx->audio_buffer, data, inuse < bytes ? inuse : bytes);
   }
+  int expired = af_watchdog_expired(&ctx->watchdog, ctx->audio_serial,
+                                   read > 0, !eof && read < bytes, ctx->watchdog_ms);
   if (ctx->audio_cond) switch_thread_cond_signal(ctx->audio_cond);
   switch_mutex_unlock(ctx->audio_mutex);
-
-  if (bytes_read > 0) {
-    ctx->silence_frames = 0;
-    *len = bytes_read / frame_bytes;
-    handle->sample_count += *len;
-    return SWITCH_STATUS_SUCCESS;
+  if (failed || expired) {
+    if (expired) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "[audio_fork] HTTP 连续欠载达到 %u ms\n", ctx->watchdog_ms);
+      set_http_error(ctx);
+    }
+    *len = 0; return SWITCH_STATUS_FALSE;
   }
-  if (eof || err || switch_atomic_read(&ctx->err)) {
-    *len = 0;
-    return SWITCH_STATUS_FALSE;
+  if (!eof && read < bytes) {
+    memset((char *)data + read, 0, bytes - read);
+    ++ctx->underrun_frames;
+    ctx->underrun_samples += (bytes - read) / frame_bytes;
+    read = bytes;
   }
-
-  /* 2. 欠载补偿: 缓冲临时读空, 填充静音并统计.
-   * 单次静音补偿上限严格对齐单帧规格(如 20ms = 320 采样点), 严禁单次填充巨量静音(如 2048ms)破坏混音时钟与通道时序. */
-  size_t max_silence_samples = ctx->samplerate ? (ctx->samplerate * 20U / 1000U) : 320U;
-  if (*len > max_silence_samples) {
-    *len = max_silence_samples;
-    bytes_needed = *len * frame_bytes;
-  }
-  memset(data, 0, bytes_needed);
-  *len = bytes_needed / frame_bytes;
-  ctx->silence_frames++;
-  ctx->underrun_frames++;
-  ctx->underrun_samples += *len;
-  if (ctx->max_silence_frames && ctx->silence_frames >= ctx->max_silence_frames) {
-    switch_atomic_set(&ctx->err, 1);
-    switch_atomic_set(&ctx->abort_requested, 1);
-    *len = 0;
-    return SWITCH_STATUS_FALSE;
-  }
+  *len = read / frame_bytes;
   handle->sample_count += *len;
-  return SWITCH_STATUS_SUCCESS;
+  return *len ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 }
 
 switch_status_t audio_fork_http_file_close(switch_file_handle_t *handle) {
   if (!handle || !handle->private_info) return SWITCH_STATUS_SUCCESS;
   audio_fork_http_ctx_t *ctx = (audio_fork_http_ctx_t *)handle->private_info;
   handle->private_info = NULL;
+  switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+    "[audio_fork] HTTP playback source=%u output=%u core_resampler=%d samples=%lu url=%s\n",
+    ctx->source_rate, ctx->samplerate, handle->resampler != NULL, (unsigned long)handle->sample_count, ctx->stream_url);
 
   /* 输出播放期间的欠载统计日志 (便于排查弱网或 TTS 推流抖动) */
   if (ctx->underrun_frames) {

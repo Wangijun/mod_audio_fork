@@ -54,6 +54,7 @@
 #include "audio_pipe.hpp"
 #include "vector_math.h"
 #include "lws_glue.h"
+#include "audio_fork_ws.h"
 
 #define RTP_PACKETIZATION_PERIOD 20
 #define FRAME_SIZE_8000  320 /* 8kHz 下每 20ms 单声道 320 字节 */
@@ -153,89 +154,18 @@ namespace {
 
   void destroy_tech_pvt(private_t *tech_pvt);
 
-  /**
-   * @brief 处理 WebSocket 接收到的下行裸 PCM 二进制音频帧
-   *
-   * 核心机制:
-   * 1. 零长帧定稿: 若 dataLength == 0, 视为远端发送的音频结束标记 (EOF), 设置 downstream_eof = 1;
-   * 2. 跨帧碎片对齐: 若上次接收留下不足 1 个完整采样的残余字节 (如单声道 1 字节, 双声道 1~3 字节),
-   *    优先使用本次数据头拼齐写入, 杜绝音频相位错位或杂音;
-   * 3. 采样整帧写入: 计算 complete = remaining - (remaining % frame_bytes), 保证写入环形缓冲的均为完整采样;
-   * 4. 尾部碎片暂存: 将剩余不足 frame_bytes 的尾巴存入 downstream_partial, 留待下一帧拼装.
-   */
-  void processIncomingBinary(private_t* tech_pvt, switch_core_session_t* session, const char* data, size_t dataLength) {
-    if (!tech_pvt || !session || !tech_pvt->downstream_mutex || (dataLength > 0 && !data)) return;
-
-    bool report_overrun = false;
-    switch_mutex_lock(tech_pvt->downstream_mutex);
-    if (dataLength == 0) {
-      switch_atomic_set(&tech_pvt->downstream_eof, 1);
-      switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
-      if (tech_pvt->downstream_partial_len != 0) {
-        switch_atomic_set(&tech_pvt->downstream_partial_error, 1);
-        /* 延迟到 file_read 排空完整帧后再报告协议错误. */
-      }
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-        "(%u) 下行收到零长帧定稿信号, 标记 downstream_eof=1\n", tech_pvt->id);
-    } else if (tech_pvt->downstream_buffer &&
-               switch_atomic_read(&tech_pvt->downstream_accept_audio) &&
-               !switch_atomic_read(&tech_pvt->downstream_interrupted) &&
-               !switch_atomic_read(&tech_pvt->downstream_eof)) {
-      const size_t frame_bytes = (tech_pvt->downstream_channels == 2 ? 4U : 2U);
-      size_t offset = 0;
-
-      /* 先补齐上一个 WebSocket fragment 留下的半个采样帧. */
-      if (tech_pvt->downstream_partial_len != 0) {
-        size_t need = frame_bytes - tech_pvt->downstream_partial_len;
-        size_t take = (dataLength < need) ? dataLength : need;
-        memcpy(tech_pvt->downstream_partial + tech_pvt->downstream_partial_len, data, take);
-        tech_pvt->downstream_partial_len = (uint8_t)(tech_pvt->downstream_partial_len + take);
-        offset += take;
-        if (tech_pvt->downstream_partial_len == frame_bytes) {
-          size_t before = switch_buffer_inuse(tech_pvt->downstream_buffer);
-          switch_buffer_write(tech_pvt->downstream_buffer, tech_pvt->downstream_partial, frame_bytes);
-          size_t after = switch_buffer_inuse(tech_pvt->downstream_buffer);
-          if (after < before || after - before != frame_bytes) {
-            switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
-            if (!switch_atomic_read(&tech_pvt->downstream_overrun_notified)) {
-              switch_atomic_set(&tech_pvt->downstream_overrun_notified, 1);
-              report_overrun = true;
-            }
-          }
-          tech_pvt->downstream_partial_len = 0;
-        }
-      }
-
-      if (switch_atomic_read(&tech_pvt->downstream_accept_audio) && offset < dataLength) {
-        size_t remaining = dataLength - offset;
-        size_t complete = remaining - (remaining % frame_bytes);
-        if (complete > 0) {
-          size_t before = switch_buffer_inuse(tech_pvt->downstream_buffer);
-          switch_buffer_write(tech_pvt->downstream_buffer, data + offset, complete);
-          size_t after = switch_buffer_inuse(tech_pvt->downstream_buffer);
-          if (after < before || after - before != complete) {
-            switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
-            if (!switch_atomic_read(&tech_pvt->downstream_overrun_notified)) {
-              switch_atomic_set(&tech_pvt->downstream_overrun_notified, 1);
-              report_overrun = true;
-            }
-          }
-          offset += complete;
-        }
-        size_t tail = dataLength - offset;
-        if (tail > 0 && tail < frame_bytes) {
-          memcpy(tech_pvt->downstream_partial, data + offset, tail);
-          tech_pvt->downstream_partial_len = (uint8_t)tail;
-        }
-      }
-    }
-    switch_mutex_unlock(tech_pvt->downstream_mutex);
-
-    if (report_overrun) {
+  /* 事件回调始终在生产者解锁后执行。speak_done 与零长帧共用同一幂等结束路径。 */
+  void processIncomingBinary(private_t* p, switch_core_session_t* session, const char* data, size_t bytes) {
+    if (!p || !session || !p->downstream_mutex || (bytes && !data)) return;
+    int error = audio_fork_ws_produce(p, data, bytes);
+    if (error) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-        "(%u) 下行 PCM 缓冲区空间不足, 停止接收音频\n", tech_pvt->id);
-      switch_atomic_set(&tech_pvt->downstream_eof, 1);
-      if (tech_pvt->responseHandler) tech_pvt->responseHandler(session, EVENT_BUFFER_OVERRUN, NULL);
+                        "下行转换失败: %s\n", af_pcm_error(error));
+      if (p->responseHandler) {
+        std::string payload = std::string("{\"code\":\"") + af_pcm_error(error) + "\"}";
+        p->responseHandler(session, error == AF_PCM_SINK ? EVENT_BUFFER_OVERRUN : EVENT_ERROR,
+                           const_cast<char *>(payload.c_str()));
+      }
     }
   }
 
@@ -278,7 +208,8 @@ namespace {
             switch_atomic_set(&tech_pvt->downstream_interrupted, 1);
             switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
             switch_atomic_set(&tech_pvt->downstream_eof, 0);
-            tech_pvt->downstream_partial_len = 0;
+            af_pcm_reset(tech_pvt->downstream_pcm, tech_pvt->downstream_sample_rate,
+                         tech_pvt->downstream_output_rate, tech_pvt->downstream_channels);
             if (tech_pvt->downstream_buffer) {
               switch_buffer_zero(tech_pvt->downstream_buffer);
             }
@@ -293,36 +224,20 @@ namespace {
           tech_pvt->responseHandler(session, EVENT_KILL_AUDIO, killPayload.get());
         }
         else if (0 == type.compare("speak_start")) {
-          if (tech_pvt->downstream_mutex) {
-            switch_mutex_lock(tech_pvt->downstream_mutex);
-            switch_atomic_set(&tech_pvt->downstream_accept_audio, 1);
-            switch_atomic_set(&tech_pvt->downstream_eof, 0);
-            tech_pvt->downstream_partial_len = 0;
-            /* 每个 speak_start 开启新的语音段; 清掉上一段尚未消费的 PCM,
-               避免旧播放句柄的尾音泄漏到新代际. */
-            if (tech_pvt->downstream_buffer) switch_buffer_zero(tech_pvt->downstream_buffer);
-            switch_atomic_set(&tech_pvt->downstream_partial_error, 0);
-            switch_atomic_set(&tech_pvt->downstream_partial_error_notified, 0);
-            switch_atomic_set(&tech_pvt->downstream_overrun_notified, 0);
-            tech_pvt->downstream_generation++;
-            /* 旧句柄通过 generation 不匹配退出. 全局 interrupted 必须复位,
-               否则旧句柄尚未 close 时到达的新句 PCM 会被误丢弃. */
-            switch_atomic_set(&tech_pvt->downstream_interrupted, 0);
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-              "(%u) 收到 speak_start 文本信令, 开启新代际并接收新句 PCM(旧播放句柄数=%u)\n",
-              tech_pvt->id, switch_atomic_read(&tech_pvt->downstream_handles));
-            switch_mutex_unlock(tech_pvt->downstream_mutex);
+          cJSON *rate = jsonData ? cJSON_GetObjectItem(jsonData, "rate") : NULL;
+          uint32_t value = 0;
+          if (rate) {
+            if (!cJSON_IsNumber(rate) || rate->valuedouble < 8000 || rate->valuedouble > 64000 ||
+                rate->valuedouble != rate->valueint || rate->valueint % 8000) value = UINT32_MAX;
+            else value = (uint32_t)rate->valueint;
+          }
+          int error = audio_fork_ws_start(tech_pvt, value, rate != NULL);
+          if (error && tech_pvt->responseHandler) {
+            tech_pvt->responseHandler(session, EVENT_ERROR, (char *)"{\"code\":\"pcm_invalid_format\"}");
           }
         }
         else if (0 == type.compare("speak_done")) {
-          if (tech_pvt->downstream_mutex) {
-            switch_mutex_lock(tech_pvt->downstream_mutex);
-            switch_atomic_set(&tech_pvt->downstream_eof, 1);
-            switch_atomic_set(&tech_pvt->downstream_accept_audio, 0);
-            switch_mutex_unlock(tech_pvt->downstream_mutex);
-          }
-          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-            "(%u) 收到 speak_done 文本信令定稿标记\n", tech_pvt->id);
+          processIncomingBinary(tech_pvt, session, NULL, 0);
         }
         else if (0 == type.compare("transcription")) {
           std::unique_ptr<char, cJSON_String_Deleter> jsonString(cJSON_PrintUnformatted(jsonData));
@@ -381,6 +296,7 @@ namespace {
         switch_atomic_read(&tech_pvt->downstream_handles) == 0 && tech_pvt->downstream_mutex) {
       switch_mutex_lock(tech_pvt->downstream_mutex);
       if (tech_pvt->downstream_buffer) switch_buffer_destroy(&tech_pvt->downstream_buffer);
+      af_pcm_destroy(&tech_pvt->downstream_pcm);
       switch_mutex_unlock(tech_pvt->downstream_mutex);
     }
   }
@@ -747,14 +663,19 @@ namespace {
     switch_atomic_set(&tech_pvt->downstream_eof, 0);
     switch_atomic_set(&tech_pvt->downstream_interrupted, 0);
     switch_atomic_set(&tech_pvt->downstream_accept_audio, 1);
-    switch_atomic_set(&tech_pvt->downstream_partial_error, 0);
-    switch_atomic_set(&tech_pvt->downstream_partial_error_notified, 0);
-    switch_atomic_set(&tech_pvt->downstream_overrun_notified, 0);
+    switch_atomic_set(&tech_pvt->downstream_error, 0);
     switch_atomic_set(&tech_pvt->downstream_handles, 0);
-    tech_pvt->downstream_partial_len = 0;
     tech_pvt->downstream_generation = 0;
     tech_pvt->downstream_sample_rate = desiredSampling ? (uint32_t)desiredSampling : 16000;
     tech_pvt->downstream_channels = channels ? (uint32_t)channels : 1;
+    tech_pvt->downstream_default_rate = tech_pvt->downstream_sample_rate;
+    tech_pvt->downstream_output_rate = (uint32_t)sampling;
+    tech_pvt->downstream_pcm = af_pcm_create(tech_pvt->downstream_sample_rate,
+        tech_pvt->downstream_output_rate, tech_pvt->downstream_channels, SWITCH_RESAMPLE_QUALITY);
+    if (!tech_pvt->downstream_pcm) {
+      destroy_tech_pvt(tech_pvt);
+      return SWITCH_STATUS_FALSE;
+    }
 
     if (desiredSampling != sampling) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%u) 从 %u 重采样到 %u\n", tech_pvt->id, sampling, desiredSampling);
@@ -808,6 +729,7 @@ namespace {
       if (tech_pvt->downstream_buffer && switch_atomic_read(&tech_pvt->downstream_handles) == 0) {
         switch_buffer_destroy(&tech_pvt->downstream_buffer);
         tech_pvt->downstream_buffer = nullptr;
+        af_pcm_destroy(&tech_pvt->downstream_pcm);
       }
       switch_mutex_unlock(tech_pvt->downstream_mutex);
     }

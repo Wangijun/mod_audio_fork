@@ -44,10 +44,16 @@ typedef struct audio_fork_ws_ctx {
   uint32_t                    prebuffer_bytes;    /**< 起播所需预缓冲字节门限 */
   int                         prebuffered;        /**< 是否已完成首次起播预缓冲 */
 
-  uint32_t                    silence_frames;     /**< 连续静音欠载帧计数 (看门狗) */
-  uint32_t                    max_silence_frames; /**< 静音看门狗最大帧阈值 (默认 150 帧 = 3000ms) */
+  af_watchdog_t               watchdog;
+  uint32_t                    watchdog_ms;
   uint64_t                    generation;         /**< 打开句柄时锁定的代际, 防止串音 */
 } audio_fork_ws_ctx_t;
+
+/* 生产者接口：内部使用 downstream_mutex，不在锁内分发事件。 */
+int audio_fork_ws_start(private_t *p, uint32_t rate, int declared);
+int audio_fork_ws_produce(private_t *p, const void *data, size_t bytes);
+/* 由 open 在 downstream_mutex 内调用；URL rate/sampling 均表示源格式。 */
+int audio_fork_ws_format_locked(private_t *p, uint32_t source, uint32_t channels, uint32_t output);
 
 /**
  * @brief 打开 WebSocket 下行内存桥播放句柄

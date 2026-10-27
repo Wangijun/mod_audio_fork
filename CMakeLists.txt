@@ -109,6 +109,7 @@ find_package(CURL REQUIRED)
 # 设置源文件
 set(MOD_AUDIO_FORK_SOURCES
     mod_audio_fork.c
+    downstream_pcm.c
     audio_fork_http.c
     audio_fork_ws.c
     lws_glue.cpp
