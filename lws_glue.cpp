@@ -642,21 +642,20 @@ namespace {
     if (!ap || !ap->isValid()) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "分配AudioPipe时出错\n");
       if (ap) ap->closeAndDestroy();
+      destroy_tech_pvt(tech_pvt);
       return SWITCH_STATUS_FALSE;
     }
 
     tech_pvt->pAudioPipe = static_cast<void *>(ap);
     if (switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session)) != SWITCH_STATUS_SUCCESS) {
-      ap->closeAndDestroy();
-      tech_pvt->pAudioPipe = nullptr;
+      destroy_tech_pvt(tech_pvt);
       return SWITCH_STATUS_GENERR;
     }
 
     /* 初始化下行 WebSocket 内存桥环形缓冲区与互斥锁(最大 2 MiB, 覆盖 5 秒 64kHz 双声道预缓冲) */
     if (switch_mutex_init(&tech_pvt->downstream_mutex, SWITCH_MUTEX_NESTED, switch_core_session_get_pool(session)) != SWITCH_STATUS_SUCCESS ||
         switch_buffer_create_dynamic(&tech_pvt->downstream_buffer, 4096, 16384, 2U * 1024U * 1024U) != SWITCH_STATUS_SUCCESS) {
-      ap->closeAndDestroy();
-      tech_pvt->pAudioPipe = nullptr;
+      destroy_tech_pvt(tech_pvt);
       return SWITCH_STATUS_MEMERR;
     }
     switch_atomic_set(&tech_pvt->downstream_active, 0);

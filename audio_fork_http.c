@@ -359,6 +359,7 @@ switch_status_t audio_fork_http_file_open(switch_file_handle_t *handle, const ch
   if (switch_mutex_init(&ctx->audio_mutex, SWITCH_MUTEX_NESTED, ctx->pool) != SWITCH_STATUS_SUCCESS ||
       switch_thread_cond_create(&ctx->audio_cond, ctx->pool) != SWITCH_STATUS_SUCCESS ||
       switch_buffer_create_dynamic(&ctx->audio_buffer, 4096, 16384, MAX_AUDIO_FORK_BUFFER_BYTES) != SWITCH_STATUS_SUCCESS) {
+    audio_fork_http_cleanup_resources(ctx);
     return SWITCH_STATUS_MEMERR;
   }
 
